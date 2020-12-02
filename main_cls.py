@@ -21,7 +21,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.optim.lr_scheduler import CosineAnnealingLR, StepLR
-from data import ModelNet40
+from data import ModelNet40, SciTSR
 from model import PointNet, DGCNN_cls
 import numpy as np
 from torch.utils.data import DataLoader
@@ -42,9 +42,9 @@ def _init_():
     os.system('cp data.py checkpoints' + '/' + args.exp_name + '/' + 'data.py.backup')
 
 def train(args, io):
-    train_loader = DataLoader(ModelNet40(partition='train', num_points=args.num_points), num_workers=8,
+    train_loader = DataLoader(SciTSR(partition='train', dataset_dir='/home/lihuichao/academic/SciTSR/dataset'), num_workers=8,
                               batch_size=args.batch_size, shuffle=True, drop_last=True)
-    test_loader = DataLoader(ModelNet40(partition='test', num_points=args.num_points), num_workers=8,
+    test_loader = DataLoader(SciTSR(partition='test', dataset_dir='/home/lihuichao/academic/SciTSR/dataset'), num_workers=8,
                              batch_size=args.test_batch_size, shuffle=True, drop_last=False)
 
     device = torch.device("cuda" if args.cuda else "cpu")
@@ -86,8 +86,8 @@ def train(args, io):
         model.train()
         train_pred = []
         train_true = []
-        for data, label in train_loader:
-            data, label = data.to(device), label.to(device).squeeze()
+        for data, row_matrix, col_matrix in train_loader:
+            data, row_matrix, col_matrix = data.to(device), row_matrix.to(device), col_matrix.to(device)
             data = data.permute(0, 2, 1)
             batch_size = data.size()[0]
             opt.zero_grad()

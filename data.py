@@ -12,7 +12,6 @@ Modified by
 @Time: 2020/2/27 9:32 PM
 """
 
-
 import os
 import sys
 import glob
@@ -76,7 +75,7 @@ def load_data_cls(partition):
     DATA_DIR = os.path.join(BASE_DIR, 'data')
     all_data = []
     all_label = []
-    for h5_name in glob.glob(os.path.join(DATA_DIR, 'modelnet40*hdf5_2048', '*%s*.h5'%partition)):
+    for h5_name in glob.glob(os.path.join(DATA_DIR, 'modelnet40*hdf5_2048', '*%s*.h5' % partition)):
         f = h5py.File(h5_name, 'r+')
         data = f['data'][:].astype('float32')
         label = f['label'][:].astype('int64')
@@ -99,7 +98,7 @@ def load_data_partseg(partition):
         file = glob.glob(os.path.join(DATA_DIR, 'shapenet*hdf5*', '*train*.h5')) \
                + glob.glob(os.path.join(DATA_DIR, 'shapenet*hdf5*', '*val*.h5'))
     else:
-        file = glob.glob(os.path.join(DATA_DIR, 'shapenet*hdf5*', '*%s*.h5'%partition))
+        file = glob.glob(os.path.join(DATA_DIR, 'shapenet*hdf5*', '*%s*.h5' % partition))
     for h5_name in file:
         f = h5py.File(h5_name, 'r+')
         data = f['data'][:].astype('float32')
@@ -163,31 +162,73 @@ def load_data_semseg(partition, test_area):
 
 
 def translate_pointcloud(pointcloud):
-    xyz1 = np.random.uniform(low=2./3., high=3./2., size=[3])
+    xyz1 = np.random.uniform(low=2. / 3., high=3. / 2., size=[3])
     xyz2 = np.random.uniform(low=-0.2, high=0.2, size=[3])
-       
+
     translated_pointcloud = np.add(np.multiply(pointcloud, xyz1), xyz2).astype('float32')
     return translated_pointcloud
 
 
 def jitter_pointcloud(pointcloud, sigma=0.01, clip=0.02):
     N, C = pointcloud.shape
-    pointcloud += np.clip(sigma * np.random.randn(N, C), -1*clip, clip)
+    pointcloud += np.clip(sigma * np.random.randn(N, C), -1 * clip, clip)
     return pointcloud
 
 
 def rotate_pointcloud(pointcloud):
-    theta = np.pi*2 * np.random.uniform()
-    rotation_matrix = np.array([[np.cos(theta), -np.sin(theta)],[np.sin(theta), np.cos(theta)]])
-    pointcloud[:,[0,2]] = pointcloud[:,[0,2]].dot(rotation_matrix) # random rotation (x,z)
+    theta = np.pi * 2 * np.random.uniform()
+    rotation_matrix = np.array([[np.cos(theta), -np.sin(theta)], [np.sin(theta), np.cos(theta)]])
+    pointcloud[:, [0, 2]] = pointcloud[:, [0, 2]].dot(rotation_matrix)  # random rotation (x,z)
     return pointcloud
+
+
+def load_scitsr_data(dataset_dir, partition, max_vertice_num=512, feature_size=5):
+    import json
+
+    data, row_matrices, col_matrices = [], [], []
+    CHUNK = 'chunk'
+    REL = 'rel'
+    main_folder = os.path.join(dataset_dir, partition)
+    chunk_dir = os.path.join(main_folder, CHUNK)
+    rel_dir = os.path.join(main_folder, REL)
+    for chunk_file_path in os.listdir(chunk_dir):
+        if chunk_file_path.endswith('.ipynb_checkpoints'):
+            continue
+        feature = np.zeros([max_vertice_num, feature_size])
+        chunk_id = chunk_file_path.split('.')[0:-1]
+        chunk_id = '.'.join(chunk_id)
+        with open(os.path.join(chunk_dir, chunk_file_path)) as f:
+            obj = json.load(f)
+            chunks = obj['chunks']
+            if len(chunks) > max_vertice_num:
+                # Todo: 处理chunk数大于max_vertice_num的情况
+                continue
+            i = 0
+            for chunk in chunks:
+                feature[i] = chunk['pos'][0], chunk['pos'][1], chunk['pos'][2], chunk['pos'][3], len(chunk['text'])
+                i += 1
+        num_points = len(chunks)
+        row_matrix, col_matrix = np.zeros([max_vertice_num, max_vertice_num], dtype=int), np.zeros([max_vertice_num, max_vertice_num], dtype=int)
+        with open(os.path.join(rel_dir, f'{chunk_id}.rel')) as f:
+            for line in f:
+                start, end, rel_type = line.split('\t')
+                start, end = int(start), int(end)
+                rel_type = rel_type.split(':')[0]
+                if rel_type == '1':
+                    row_matrix[start, end] = 1
+                    row_matrix[end, start] = 1
+                elif rel_type == '2':
+                    col_matrix[start, end] = 1
+                    col_matrix[end, start] = 1
+        data.append({'features': np.array(feature), 'row_matrix': row_matrix, 'col_matrix': col_matrix, 'num_vertices': num_points})
+    return data
 
 
 class ModelNet40(Dataset):
     def __init__(self, num_points, partition='train'):
         self.data, self.label = load_data_cls(partition)
         self.num_points = num_points
-        self.partition = partition        
+        self.partition = partition
 
     def __getitem__(self, item):
         pointcloud = self.data[item][:self.num_points]
@@ -201,16 +242,30 @@ class ModelNet40(Dataset):
         return self.data.shape[0]
 
 
+class SciTSR(Dataset):
+    def __init__(self, dataset_dir, max_vertice_num=1024, feature_size=5, partition='train'):
+        self.data = load_scitsr_data(dataset_dir, partition, max_vertice_num)  # data: [num_points * feature_size], row/col_matix: [num_points, num_points]
+        self.feature_size = feature_size
+        self.max_vertice_num = max_vertice_num
+        self.partition = partition
+
+    def __getitem__(self, i):
+        return self.data[i]
+
+    def __len__(self):
+        return len(self.data)
+
+
 class ShapeNetPart(Dataset):
     def __init__(self, num_points, partition='train', class_choice=None):
         self.data, self.label, self.seg = load_data_partseg(partition)
-        self.cat2id = {'airplane': 0, 'bag': 1, 'cap': 2, 'car': 3, 'chair': 4, 
-                       'earphone': 5, 'guitar': 6, 'knife': 7, 'lamp': 8, 'laptop': 9, 
+        self.cat2id = {'airplane': 0, 'bag': 1, 'cap': 2, 'car': 3, 'chair': 4,
+                       'earphone': 5, 'guitar': 6, 'knife': 7, 'lamp': 8, 'laptop': 9,
                        'motor': 10, 'mug': 11, 'pistol': 12, 'rocket': 13, 'skateboard': 14, 'table': 15}
         self.seg_num = [4, 2, 2, 4, 4, 3, 3, 2, 4, 2, 6, 2, 3, 3, 3, 3]
         self.index_start = [0, 4, 6, 8, 12, 16, 19, 22, 24, 28, 30, 36, 38, 41, 44, 47]
         self.num_points = num_points
-        self.partition = partition        
+        self.partition = partition
         self.class_choice = class_choice
 
         if self.class_choice != None:
@@ -245,7 +300,7 @@ class S3DIS(Dataset):
     def __init__(self, num_points=4096, partition='train', test_area='1'):
         self.data, self.seg = load_data_semseg(partition, test_area)
         self.num_points = num_points
-        self.partition = partition        
+        self.partition = partition
 
     def __getitem__(self, item):
         pointcloud = self.data[item][:self.num_points]
@@ -263,21 +318,26 @@ class S3DIS(Dataset):
 
 
 if __name__ == '__main__':
-    train = ModelNet40(1024)
-    test = ModelNet40(1024, 'test')
-    data, label = train[0]
-    print(data.shape)
-    print(label.shape)
+    # train = ModelNet40(1024)
+    # test = ModelNet40(1024, 'test')
+    # data, label = train[0]
+    # print(data.shape)
+    # print(label.shape)
+    #
+    # trainval = ShapeNetPart(2048, 'trainval')
+    # test = ShapeNetPart(2048, 'test')
+    # data, label, seg = trainval[0]
+    # print(data.shape)
+    # print(label.shape)
+    # print(seg.shape)
+    #
+    # train = S3DIS(4096)
+    # test = S3DIS(4096, 'test')
+    # data, seg = train[0]
+    # print(data.shape)
+    # print(seg.shape)
 
-    trainval = ShapeNetPart(2048, 'trainval')
-    test = ShapeNetPart(2048, 'test')
-    data, label, seg = trainval[0]
-    print(data.shape)
-    print(label.shape)
-    print(seg.shape)
+    scitsr = SciTSR(dataset_dir='/home/lihuichao/academic/SciTSR/dataset')
+    data, row_matrix, col_matrix = scitsr[0]
+    print(data.shape, row_matrix, col_matrix)
 
-    train = S3DIS(4096)
-    test = S3DIS(4096, 'test')
-    data, seg = train[0]
-    print(data.shape)
-    print(seg.shape)

@@ -28,7 +28,7 @@ def knn(x, k):
     inner = -2*torch.matmul(x.transpose(2, 1), x)
     xx = torch.sum(x**2, dim=1, keepdim=True)
     pairwise_distance = -xx - inner - xx.transpose(2, 1)
- 
+
     idx = pairwise_distance.topk(k=k, dim=-1)[1]   # (batch_size, num_points, k)
     return idx
 
@@ -307,17 +307,31 @@ class DGCNN_partseg(nn.Module):
         x = self.conv9(x)                       # (batch_size, 256, num_points) -> (batch_size, 256, num_points)
         x = self.dp2(x)
         x = self.conv10(x)                      # (batch_size, 256, num_points) -> (batch_size, 128, num_points)
-        x = self.conv11(x)                      # (batch_size, 256, num_points) -> (batch_size, seg_num_all, num_points)
+        # x = self.conv11(x)                      # (batch_size, 256, num_points) -> (batch_size, seg_num_all, num_points)
         
+        return x
+
+class PairClassfier(nn.Module):
+    def __init__(self, input_size):
+        super(PairClassfier, self).__init__()
+        self.dense1 = nn.Linear(input_size, 256)
+        self.dense2 = nn.Linear(256, 18)
+        self.dense3 = nn.Linear(18, 2)
+
+    def forward(self, x):
+        x = self.dense1(x)
+        x = self.dense2(x)
+        x = self.dense3(x)
         return x
 
 
 class DGCNN_semseg(nn.Module):
-    def __init__(self, args):
+
+    def __init__(self, args, input_feature_size=3):
         super(DGCNN_semseg, self).__init__()
         self.args = args
         self.k = args.k
-        
+        self.input_feature_size = input_feature_size
         self.bn1 = nn.BatchNorm2d(64)
         self.bn2 = nn.BatchNorm2d(64)
         self.bn3 = nn.BatchNorm2d(64)
@@ -327,7 +341,7 @@ class DGCNN_semseg(nn.Module):
         self.bn7 = nn.BatchNorm1d(512)
         self.bn8 = nn.BatchNorm1d(256)
 
-        self.conv1 = nn.Sequential(nn.Conv2d(18, 64, kernel_size=1, bias=False),
+        self.conv1 = nn.Sequential(nn.Conv2d(self.input_feature_size * 2, 64, kernel_size=1, bias=False),
                                    self.bn1,
                                    nn.LeakyReLU(negative_slope=0.2))
         self.conv2 = nn.Sequential(nn.Conv2d(64, 64, kernel_size=1, bias=False),
@@ -359,7 +373,7 @@ class DGCNN_semseg(nn.Module):
         batch_size = x.size(0)
         num_points = x.size(2)
 
-        x = get_graph_feature(x, k=self.k, dim9=True)   # (batch_size, 9, num_points) -> (batch_size, 9*2, num_points, k)
+        x = get_graph_feature(x, k=self.k, dim9=False)   # (batch_size, 9, num_points) -> (batch_size, 9*2, num_points, k)
         x = self.conv1(x)                       # (batch_size, 9*2, num_points, k) -> (batch_size, 64, num_points, k)
         x = self.conv2(x)                       # (batch_size, 64, num_points, k) -> (batch_size, 64, num_points, k)
         x1 = x.max(dim=-1, keepdim=False)[0]    # (batch_size, 64, num_points, k) -> (batch_size, 64, num_points)
@@ -384,6 +398,6 @@ class DGCNN_semseg(nn.Module):
         x = self.conv7(x)                       # (batch_size, 1024+64*3, num_points) -> (batch_size, 512, num_points)
         x = self.conv8(x)                       # (batch_size, 512, num_points) -> (batch_size, 256, num_points)
         x = self.dp1(x)
-        x = self.conv9(x)                       # (batch_size, 256, num_points) -> (batch_size, 13, num_points)
+        # x = self.conv9(x)                       # (batch_size, 256, num_points) -> (batch_size, 13, num_points)
         
         return x
