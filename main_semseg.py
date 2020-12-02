@@ -14,6 +14,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+import sys
 from torch.optim.lr_scheduler import CosineAnnealingLR, StepLR
 from data import S3DIS, SciTSR
 from model import DGCNN_semseg, PairClassfier
@@ -21,7 +22,11 @@ import numpy as np
 from torch.utils.data import DataLoader
 from util import cal_loss, IOStream
 import sklearn.metrics as metrics
+from loguru import logger
+from tqdm import tqdm
 
+logger.remove()
+logger.add(sys.stdout, level="INFO")
 
 def _init_():
     if not os.path.exists('checkpoints'):
@@ -84,7 +89,7 @@ def train(args, io):
         scheduler = StepLR(opt, 20, 0.5, args.epochs)
 
     best_test_iou = 0
-    for epoch in range(args.epochs):
+    for epoch in tqdm(range(args.epochs)):
         ####################
         # Train
         ####################
@@ -97,7 +102,7 @@ def train(args, io):
         train_true_seg = []
         train_pred_seg = []
         train_label_seg = []
-        for data in train_loader:
+        for data in tqdm(train_loader):
             features, row_matrix, col_matrix, num_vertices = data['features'].type(torch.FloatTensor), data[
                 'row_matrix'].type(torch.FloatTensor), data['col_matrix'].type(torch.FloatTensor), data['num_vertices']
             data, row_matrix, col_matrix, num_vertices = features.to(device), row_matrix.to(device), col_matrix.to(
@@ -156,11 +161,29 @@ def train(args, io):
             # Todo: random sampling
             row_weights = torch.ones([row_sample_shape])
             col_weights = torch.ones([col_sample_shape])
-            row_sampling = torch.multinomial(row_weights, row_input_shape)
-            col_sampling = torch.multinomial(col_weights, col_input_shape)
-            row_point3 = row_point3[row_sampling] if row_point3.size(0) > (row_input_shape) else row_point3
+
+            logger.debug(f'shape of row_weights: {row_weights.shape}')
+            logger.debug(f'shape of row_input_shape: {row_input_shape}')
+            # sampling negative samples from original matrix
+            row_sampling = torch.multinomial(row_weights,
+                                             row_input_shape) if row_sample_shape > row_input_shape else torch.arange(
+                row_sample_shape)
+            col_sampling = torch.multinomial(col_weights,
+                                             col_input_shape) if col_sample_shape > col_input_shape else torch.arange(
+                col_sample_shape)
+
+            logger.debug(f'row sampling shape: {row_sampling.shape}')
+            logger.debug(f'row point3 shape: {row_point3.shape}')
+
+            # when #negative sampling examples is smaller than positive number, we need to expand negtive example
+            # a sample strategy is to padding negative vector with zeors
+
+            row_neg_point = torch.zeros([row_input_shape, 256]).to(device)
+            row_neg_point[:row_sampling.size(0)] = row_point3[row_sampling]
+
             # row_point4 = row_point4[:row_input_shape] if row_point4.size(0) > (row_input_shape) else row_point4
-            col_point3 = col_point3[col_sampling] if col_point3.size(0) > (col_input_shape) else col_point3
+            col_neg_point = torch.zeros([col_input_shape, 256]).to(device)
+            col_neg_point[:col_sampling.size(0)] = col_point3[col_sampling]
             # col_point4 = col_point4[:col_input_shape] if col_point4.size(0) > (col_input_shape) else col_point4
 
             # Todo: sampling from row and col
@@ -168,31 +191,31 @@ def train(args, io):
             # predict relation between row point & col point
 
             row_pos_input = torch.cat((row_point1, row_point2), 1)
-            row_neg_input1, row_neg_input2 = torch.cat((row_point3, row_point1), 1), torch.cat((row_point3, row_point2),
-                                                                                               1)
+
+            row_neg_input1, row_neg_input2 = torch.cat((row_neg_point, row_point1), 1), torch.cat(
+                (row_neg_point, row_point2),
+                1)
             row_neg_input = torch.cat((row_neg_input1, row_neg_input2), 0)
 
             col_pos_input = torch.cat((col_point1, col_point2), 1)
-            col_neg_input1, col_neg_input2 = torch.cat((col_point3, col_point1), 1), torch.cat((col_point3, col_point2),
-                                                                                               1)
+            col_neg_input1, col_neg_input2 = torch.cat((col_neg_point, col_point1), 1), torch.cat(
+                (col_neg_point, col_point2),
+                1)
             col_neg_input = torch.cat((col_neg_input1, col_neg_input2), 0)
             row_input = torch.cat((row_pos_input, row_neg_input), 0)
             col_input = torch.cat((col_pos_input, col_neg_input), 0)
 
-            row_pos_gt, row_neg_gt = torch.ones([row_input_shape], dtype=torch.long), torch.zeros([row_neg_input.size(0)],
-                                                                                                  dtype=torch.long)
-            col_pos_gt, col_neg_gt = torch.ones([col_input_shape], dtype=torch.long), torch.zeros([col_neg_input.size(0)],
-                                                                                                  dtype=torch.long)
+            row_pos_gt, row_neg_gt = torch.ones([row_input_shape], dtype=torch.long), torch.zeros(
+                [row_neg_input.size(0)],
+                dtype=torch.long)
+            col_pos_gt, col_neg_gt = torch.ones([col_input_shape], dtype=torch.long), torch.zeros(
+                [col_neg_input.size(0)],
+                dtype=torch.long)
 
             row_pos_gt, row_neg_gt = row_pos_gt.to(device), row_neg_gt.to(device)
             col_pos_gt, col_neg_gt = col_pos_gt.to(device), col_neg_gt.to(device)
             row_gt = torch.cat((row_pos_gt, row_neg_gt), 0)
             col_gt = torch.cat((col_pos_gt, col_neg_gt), 0)
-
-            print(f'row input shape: {row_input.shape}')
-            print(f'col input shape: {col_input.shape}')
-            print(f'row pos shape: {row_pos_gt.shape}')
-            print(f'row neg shape: {row_neg_gt.shape}')
 
             # print(f'col gt shape: {col_gt.shape}')
 
@@ -200,16 +223,15 @@ def train(args, io):
             row_output = F.softmax(classifier(row_input), 1)
             col_output = F.softmax(classifier(col_input), 1)
 
-            print(f'row output shape: {row_output.shape}')
-
             loss = F.cross_entropy(row_output, row_gt) + F.cross_entropy(col_output, col_gt)
-            print(f'loss: {loss}')
+            logger.info(f'loss: {loss}')
             loss.backward()
             opt.step()
             # pred = seg_pred.max(dim=2)[1]  # (batch_size, num_points)
             count += batch_size
             train_loss += loss.item() * batch_size
             torch.cuda.empty_cache()
+
         torch.save({'dgcnn': model.state_dict(), 'classifier': model.state_dict()},
                    'checkpoints/%s/models/model_%s.t7' % (args.exp_name, args.test_area))
         # seg_np = seg.cpu().numpy()  # (batch_size, num_points)
@@ -360,7 +382,7 @@ if __name__ == "__main__":
     parser.add_argument('--model', type=str, default='dgcnn', metavar='N',
                         choices=['dgcnn'],
                         help='Model to use, [dgcnn]')
-    parser.add_argument('--dataset', type=str, default='S3DIS', metavar='N',
+    parser.add_argument('--dataset', type=str, default='scitsr', metavar='N',
                         choices=['S3DIS'])
     parser.add_argument('--test_area', type=str, default=None, metavar='N',
                         choices=['1', '2', '3', '4', '5', '6', 'all'])
@@ -370,7 +392,7 @@ if __name__ == "__main__":
                         help='Size of batch)')
     parser.add_argument('--epochs', type=int, default=100, metavar='N',
                         help='number of episode to train ')
-    parser.add_argument('--use_sgd', type=bool, default=True,
+    parser.add_argument('--use_sgd', type=bool, default=False,
                         help='Use SGD')
     parser.add_argument('--lr', type=float, default=0.001, metavar='LR',
                         help='learning rate (default: 0.001, 0.1 if using sgd)')
