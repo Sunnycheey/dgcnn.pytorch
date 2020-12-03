@@ -22,11 +22,13 @@ import numpy as np
 from torch.utils.data import DataLoader
 from util import cal_loss, IOStream
 import sklearn.metrics as metrics
+import shutil
 from loguru import logger
 from tqdm import tqdm
 
 logger.remove()
 logger.add(sys.stdout, level="INFO")
+
 
 def _init_():
     if not os.path.exists('checkpoints'):
@@ -67,14 +69,17 @@ def train(args, io):
     else:
         raise Exception("Not implemented")
     print(str(model))
+    if args.clear:
+        shutil.rmtree('checkpoints')
+        os.makedirs('checkpoints')
 
-    classifier = PairClassfier(512).to(device)
-    classifier = nn.DataParallel(classifier)
+    row_classifier, col_classifier = PairClassfier(512).to(device), PairClassfier(512).to(device)
+    row_classifier, col_classifier = nn.DataParallel(row_classifier), nn.DataParallel(col_classifier)
 
     model = nn.DataParallel(model)
 
     print("Let's use", torch.cuda.device_count(), "GPUs!")
-    params = list(model.parameters()) + list(classifier.parameters())
+    params = list(model.parameters()) + list(row_classifier.parameters()) + list(col_classifier.parameters())
 
     if args.use_sgd:
         print("Use SGD")
@@ -87,8 +92,8 @@ def train(args, io):
         scheduler = CosineAnnealingLR(opt, args.epochs, eta_min=1e-3)
     elif args.scheduler == 'step':
         scheduler = StepLR(opt, 20, 0.5, args.epochs)
-
-    best_test_iou = 0
+    iterate_step = 0
+    # best_test_iou = 0
     for epoch in tqdm(range(args.epochs)):
         ####################
         # Train
@@ -96,13 +101,10 @@ def train(args, io):
         train_loss = 0.0
         count = 0.0
         model.train()
-        classifier.train()
-        train_true_cls = []
-        train_pred_cls = []
-        train_true_seg = []
-        train_pred_seg = []
-        train_label_seg = []
+        row_classifier.train()
+        col_classifier.train()
         for data in tqdm(train_loader):
+            iterate_step += 1
             features, row_matrix, col_matrix, num_vertices = data['features'].type(torch.FloatTensor), data[
                 'row_matrix'].type(torch.FloatTensor), data['col_matrix'].type(torch.FloatTensor), data['num_vertices']
             data, row_matrix, col_matrix, num_vertices = features.to(device), row_matrix.to(device), col_matrix.to(
@@ -220,8 +222,8 @@ def train(args, io):
             # print(f'col gt shape: {col_gt.shape}')
 
             # g = classifier(row_input)
-            row_output = F.softmax(classifier(row_input), 1)
-            col_output = F.softmax(classifier(col_input), 1)
+            row_output = F.softmax(row_classifier(row_input), 1)
+            col_output = F.softmax(col_classifier(col_input), 1)
 
             loss = F.cross_entropy(row_output, row_gt) + F.cross_entropy(col_output, col_gt)
             logger.info(f'loss: {loss}')
@@ -231,9 +233,15 @@ def train(args, io):
             count += batch_size
             train_loss += loss.item() * batch_size
             torch.cuda.empty_cache()
+            if iterate_step % args.save_step == 0:
+                torch.save({'dgcnn': model.state_dict(), 'row_classifier': row_classifier.state_dict(),
+                            'col_classifier': col_classifier.state_dict()},
+                           f'checkpoints/checkpoints_{iterate_step}')
+        torch.save({'dgcnn': model.state_dict(), 'row_classifier': row_classifier.state_dict(),
+                    'col_classifier': col_classifier.state_dict()},
+                   f'checkpoints/checkpoints_{iterate_step}')
 
-        torch.save({'dgcnn': model.state_dict(), 'classifier': model.state_dict()},
-                   'checkpoints/%s/models/model_%s.t7' % (args.exp_name, args.test_area))
+
         # seg_np = seg.cpu().numpy()  # (batch_size, num_points)
         # pred_np = pred.detach().cpu().numpy()  # (batch_size, num_points)
         # train_true_cls.append(seg_np.reshape(-1))  # (batch_size * num_points)
@@ -307,71 +315,67 @@ def test(args, io):
     all_pred_cls = []
     all_true_seg = []
     all_pred_seg = []
-    for test_area in range(1, 7):
-        test_area = str(test_area)
-        if (args.test_area == 'all') or (test_area == args.test_area):
-            test_loader = DataLoader(S3DIS(partition='test', num_points=args.num_points, test_area=test_area),
-                                     batch_size=args.test_batch_size, shuffle=False, drop_last=False)
 
-            device = torch.device("cuda" if args.cuda else "cpu")
+    test_loader = DataLoader(SciTSR(partition='test', dataset_dir='/home/lihuichao/academic/SciTSR/dataset'),
+                             num_workers=8, batch_size=args.test_batch_size, shuffle=True, drop_last=False)
+    with torch.no_grad():
 
-            # Try to load models
-            if args.model == 'dgcnn':
-                model = DGCNN_semseg(args, 3).to(device)
-            else:
-                raise Exception("Not implemented")
+        device = torch.device("cuda" if args.cuda else "cpu")
+        dgcnn = DGCNN_semseg(args, 5).to(device)
+        dgcnn = nn.DataParallel(dgcnn)
+        model_dict = torch.load(args.model_path)
+        dgcnn.load_state_dict(model_dict['dgcnn'])
+        row_classifier, col_classifier = PairClassfier(512), PairClassfier(512)
+        row_classifier, col_classifier = nn.DataParallel(row_classifier), nn.DataParallel(col_classifier)
+        row_classifier.load_state_dict(model_dict['row_classifier'])
+        col_classifier.load_state_dict(model_dict['col_classifier'])
+        print(row_classifier)
+        dgcnn, row_classifier, col_classifier = dgcnn.to(device), row_classifier.to(device), col_classifier.to(device)
+        dgcnn, row_classifier, col_classifier = dgcnn.eval(), row_classifier.eval(), col_classifier.eval()
+        for data in tqdm(test_loader):
+            features, row_matrix, col_matrix, num_vertices = data['features'].type(torch.FloatTensor), data[
+                'row_matrix'].type(torch.FloatTensor), data['col_matrix'].type(torch.FloatTensor), data['num_vertices']
+            data, row_matrix, col_matrix, num_vertices = features.to(device), row_matrix.to(device), col_matrix.to(
+                device), num_vertices.to(device)
+            logger.info(f'num_vertices shape: {num_vertices.shape}\tdata shape: {data.shape}\trow matrix shape: {row_matrix.shape}\tcol matrix shape: {col_matrix.shape}')
+            num_vertices = num_vertices[0]
+            data = data.permute(0,2,1)
+            batch_size = data.size(0)
+            out = dgcnn(data)  # (batch_size, 256, num_points)
+            out = out[:, :, :num_vertices]  # (batch_size, 256, num_vertices)
+            pred_row_matrix = torch.zeros([num_vertices, num_vertices], dtype=torch.int).to(device)
+            pred_col_matrix = torch.zeros([num_vertices, num_vertices], dtype=torch.int).to(device)
+            possible_idx = torch.arange(num_vertices)
+            # concatenate tensor row by column
+            combinations = torch.combinations(possible_idx, r=2)  # (num_vertices, num_vertices)
+            row_features1, row_features2 = out[:, :, combinations[:, 0]], out[:, :, combinations[:,
+                                                                                    1]]  # (batch_size, 256, combination(num_vertices,2))
+            col_features1, col_features2 = out[:, :, combinations[:, 0]], out[:, :, combinations[:,
+                                                                                    1]]  # (batch_size, 256, combination(num_vertices, 2))
+            row_features1, row_features2, col_features1, col_features2 = row_features1.to(device), row_features2.to(device), col_features1.to(device), col_features2.to(device)
+            logger.debug(f'num vertices :{num_vertices}\trow1 features shape: {row_features1.shape}\tcol1 features shape: {col_features1.shape}')
+            row_pairs, col_pairs = torch.cat((row_features1, row_features2), 1), torch.cat((col_features1,
+                                                                                      col_features2), 1)  # (batch_size, 512, combination(num_vertices, 2))
+            logger.debug(f'row pairs shape:  {row_pairs.shape}\tcol pairs shape: {col_pairs.shape}')
+            row_pairs, col_pairs = row_pairs.permute(0,2,1), col_pairs.permute(0,2,1) # (batch_size, combination(num_vertices,2), 512)
+            row_output, col_output = row_classifier(row_pairs), col_classifier(
+                col_pairs)  # (batch_size, combination(num_vertices, 2), 2)
+            # row_output, col_output = row_output.permute(0, 2, 1), col_output.permute(0, 2, 1) # (batch_size, combination(num_vertices,2), 2)
 
-            model = nn.DataParallel(model)
-            model.load_state_dict(torch.load(os.path.join(args.model_root, 'model_%s.t7' % test_area)))
-            model = model.eval()
-            test_acc = 0.0
-            count = 0.0
-            test_true_cls = []
-            test_pred_cls = []
-            test_true_seg = []
-            test_pred_seg = []
-            for data, seg in test_loader:
-                data, seg = data.to(device), seg.to(device)
-                data = data.permute(0, 2, 1)
-                batch_size = data.size()[0]
-                seg_pred = model(data)
-                seg_pred = seg_pred.permute(0, 2, 1).contiguous()
-                pred = seg_pred.max(dim=2)[1]
-                seg_np = seg.cpu().numpy()
-                pred_np = pred.detach().cpu().numpy()
-                test_true_cls.append(seg_np.reshape(-1))
-                test_pred_cls.append(pred_np.reshape(-1))
-                test_true_seg.append(seg_np)
-                test_pred_seg.append(pred_np)
-            test_true_cls = np.concatenate(test_true_cls)
-            test_pred_cls = np.concatenate(test_pred_cls)
-            test_acc = metrics.accuracy_score(test_true_cls, test_pred_cls)
-            avg_per_class_acc = metrics.balanced_accuracy_score(test_true_cls, test_pred_cls)
-            test_true_seg = np.concatenate(test_true_seg, axis=0)
-            test_pred_seg = np.concatenate(test_pred_seg, axis=0)
-            test_ious = calculate_sem_IoU(test_pred_seg, test_true_seg)
-            outstr = 'Test :: test area: %s, test acc: %.6f, test avg acc: %.6f, test iou: %.6f' % (test_area,
-                                                                                                    test_acc,
-                                                                                                    avg_per_class_acc,
-                                                                                                    np.mean(test_ious))
-            io.cprint(outstr)
-            all_true_cls.append(test_true_cls)
-            all_pred_cls.append(test_pred_cls)
-            all_true_seg.append(test_true_seg)
-            all_pred_seg.append(test_pred_seg)
+            row_idx, col_idx = torch.argmax(row_output, 2), torch.argmax(col_output, 2) # (batch_size, combination(num_vertices, 2))
+            logger.debug(f'row_idx shape: {row_idx.shape}')
+            non_zero_row, non_zero_col = torch.nonzero(row_idx), torch.nonzero(col_idx) # (non_zero_num, 2)
+            logger.debug(f'non_zero_row shape: {non_zero_row.shape}')
+            r_row_idx, c_row_idx, r_col_idx, c_col_idx = non_zero_row[:, 1] // num_vertices, non_zero_row[:,1] % num_vertices, non_zero_col[:,1] // num_vertices, non_zero_col[:,1] % num_vertices
+            logger.debug(f'pred_row_matrix shape: {pred_row_matrix.shape}\tr_row_id shape: {r_row_idx.shape}')
+            pred_row_matrix[r_row_idx, c_row_idx] = 1
+            pred_col_matrix[r_col_idx, c_col_idx] = 1
 
-    if args.test_area == 'all':
-        all_true_cls = np.concatenate(all_true_cls)
-        all_pred_cls = np.concatenate(all_pred_cls)
-        all_acc = metrics.accuracy_score(all_true_cls, all_pred_cls)
-        avg_per_class_acc = metrics.balanced_accuracy_score(all_true_cls, all_pred_cls)
-        all_true_seg = np.concatenate(all_true_seg, axis=0)
-        all_pred_seg = np.concatenate(all_pred_seg, axis=0)
-        all_ious = calculate_sem_IoU(all_pred_seg, all_true_seg)
-        outstr = 'Overall Test :: test acc: %.6f, test avg acc: %.6f, test iou: %.6f' % (all_acc,
-                                                                                         avg_per_class_acc,
-                                                                                         np.mean(all_ious))
-        io.cprint(outstr)
+            # compare with ground truth row matrix and column matrix
+            gt_row_matrix, gt_col_matrix = row_matrix[:, :num_vertices, :num_vertices], col_matrix[:, :num_vertices, :num_vertices]
+
+            logger.success(f'row matrix precision: {torch.true_divide(torch.sum(torch.eq(gt_row_matrix, pred_row_matrix)), (num_vertices * num_vertices))}\t#relation: {torch.sum(pred_row_matrix)}')
+            logger.success(f'col matrix precision: {torch.true_divide(torch.sum(torch.eq(gt_col_matrix, pred_col_matrix)), (num_vertices * num_vertices))}\t#relation: {torch.sum(pred_col_matrix)}')
 
 
 if __name__ == "__main__":
@@ -386,11 +390,11 @@ if __name__ == "__main__":
                         choices=['S3DIS'])
     parser.add_argument('--test_area', type=str, default=None, metavar='N',
                         choices=['1', '2', '3', '4', '5', '6', 'all'])
-    parser.add_argument('--batch_size', type=int, default=32, metavar='batch_size',
+    parser.add_argument('--batch_size', type=int, default=16, metavar='batch_size',
                         help='Size of batch)')
-    parser.add_argument('--test_batch_size', type=int, default=16, metavar='batch_size',
+    parser.add_argument('--test_batch_size', type=int, default=1, metavar='batch_size',
                         help='Size of batch)')
-    parser.add_argument('--epochs', type=int, default=100, metavar='N',
+    parser.add_argument('--epochs', type=int, default=10, metavar='N',
                         help='number of episode to train ')
     parser.add_argument('--use_sgd', type=bool, default=False,
                         help='Use SGD')
@@ -405,7 +409,7 @@ if __name__ == "__main__":
                         help='enables CUDA training')
     parser.add_argument('--seed', type=int, default=1, metavar='S',
                         help='random seed (default: 1)')
-    parser.add_argument('--eval', type=bool, default=False,
+    parser.add_argument('--eval', type=bool, default=True,
                         help='evaluate the model')
     parser.add_argument('--num_points', type=int, default=512,
                         help='num of points to use')
@@ -417,6 +421,11 @@ if __name__ == "__main__":
                         help='Num of nearest neighbors to use')
     parser.add_argument('--model_root', type=str, default='', metavar='N',
                         help='Pretrained model root')
+    parser.add_argument('--save_step', type=int, default=600, metavar='N',
+                        help='Pretrained model root')
+    parser.add_argument('--model_path', type=str, default='/home/lihuichao/academic/dgcnn.pytorch/checkpoints/checkpoints_6910', metavar='N',
+                        help='The saved model path')
+    parser.add_argument('--clear', action='store_true')
     args = parser.parse_args()
 
     _init_()
