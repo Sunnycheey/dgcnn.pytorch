@@ -37,6 +37,8 @@ def _init_():
         os.makedirs('checkpoints/' + args.exp_name)
     if not os.path.exists('checkpoints/' + args.exp_name + '/' + 'models'):
         os.makedirs('checkpoints/' + args.exp_name + '/' + 'models')
+    if not os.path.exists(args.saved_model_dir):
+        os.makedirs(args.saved_model_dir)
     os.system('cp main_semseg.py checkpoints' + '/' + args.exp_name + '/' + 'main_semseg.py.backup')
     os.system('cp model.py checkpoints' + '/' + args.exp_name + '/' + 'model.py.backup')
     os.system('cp util.py checkpoints' + '/' + args.exp_name + '/' + 'util.py.backup')
@@ -110,7 +112,7 @@ def train(args, io):
             data, row_matrix, col_matrix, num_vertices = features.to(device), row_matrix.to(device), col_matrix.to(
                 device), num_vertices.to(device)
 
-            data = data.permute(0, 2, 1)
+            # data = data.permute(0, 2, 1)
             batch_size = data.size()[0]
             opt.zero_grad()
             all_features = model(data)  # (batch_size, 256, max_num_vertices)
@@ -127,8 +129,8 @@ def train(args, io):
             col_point2 = all_features[non_zero_col[:, 0], :, non_zero_col[:, 2]]
             col_input_shape = col_point1.size(0)
 
-            row_point3 = torch.zeros([row_input_shape, 256])
-            col_point3 = torch.zeros([col_input_shape, 256])
+            # row_point3 = torch.zeros([row_input_shape, 256])
+            # col_point3 = torch.zeros([col_input_shape, 256])
             # get negative sampling
 
             for i, v in enumerate(num_vertices):
@@ -156,35 +158,39 @@ def train(args, io):
                     # row_point4 = torch.cat((row_point4, point4), dim=0)
                     col_point3 = torch.cat((col_point3, point5), dim=0)
                     # col_point4 = torch.cat((col_point4, point6), dim=0)
-            row_sample_shape = point3.size(0)
-            col_sample_shape = point5.size(0)
+
+            row_zero_shape = row_point3.size(0)
+            col_zero_shape = col_point3.size(0)
             # col_point3 = all_features[zero_col[:, 0], :, zero_col[:, 1]]
             # col_point4 = all_features[zero_col[:, 0], :, zero_col[:, 2]]
-            # Todo: random sampling
-            row_weights = torch.ones([row_sample_shape])
-            col_weights = torch.ones([col_sample_shape])
+            row_weights = torch.ones([row_zero_shape])
+            col_weights = torch.ones([col_zero_shape])
 
             logger.debug(f'shape of row_weights: {row_weights.shape}')
             logger.debug(f'shape of row_input_shape: {row_input_shape}')
             # sampling negative samples from original matrix
             row_sampling = torch.multinomial(row_weights,
-                                             row_input_shape) if row_sample_shape > row_input_shape else torch.arange(
-                row_sample_shape)
+                                             row_input_shape) if row_zero_shape > row_input_shape else torch.arange(
+                row_zero_shape)
             col_sampling = torch.multinomial(col_weights,
-                                             col_input_shape) if col_sample_shape > col_input_shape else torch.arange(
-                col_sample_shape)
+                                             col_input_shape) if col_zero_shape > col_input_shape else torch.arange(
+                col_zero_shape)
 
             logger.debug(f'row sampling shape: {row_sampling.shape}')
             logger.debug(f'row point3 shape: {row_point3.shape}')
 
-            # when #negative sampling examples is smaller than positive number, we need to expand negtive example
-            # a sample strategy is to padding negative vector with zeors
+            # when #negative sampling examples is smaller than positive number, we need to expand negative example
+            # a sample strategy is to padding negative vector with zeros
 
             row_neg_point = torch.zeros([row_input_shape, 256]).to(device)
+            if row_input_shape > row_sampling.size(0):
+                logger.warning(f'row negative sampling padding with zero vector')
             row_neg_point[:row_sampling.size(0)] = row_point3[row_sampling]
 
             # row_point4 = row_point4[:row_input_shape] if row_point4.size(0) > (row_input_shape) else row_point4
             col_neg_point = torch.zeros([col_input_shape, 256]).to(device)
+            if col_input_shape > col_sampling.size(0):
+                logger.warning(f'col negative sampling padding with zero vector')
             col_neg_point[:col_sampling.size(0)] = col_point3[col_sampling]
             # col_point4 = col_point4[:col_input_shape] if col_point4.size(0) > (col_input_shape) else col_point4
 
@@ -236,10 +242,10 @@ def train(args, io):
             if iterate_step % args.save_step == 0:
                 torch.save({'dgcnn': model.state_dict(), 'row_classifier': row_classifier.state_dict(),
                             'col_classifier': col_classifier.state_dict()},
-                           f'checkpoints/checkpoints_{iterate_step}')
+                           f'{args.saved_model_dir}/checkpoints_{iterate_step}')
         torch.save({'dgcnn': model.state_dict(), 'row_classifier': row_classifier.state_dict(),
                     'col_classifier': col_classifier.state_dict()},
-                   f'checkpoints/checkpoints_{iterate_step}')
+                   f'{args.saved_model_dir}/checkpoints_{iterate_step}')
 
 
         # seg_np = seg.cpu().numpy()  # (batch_size, num_points)
@@ -332,6 +338,8 @@ def test(args, io):
         print(row_classifier)
         dgcnn, row_classifier, col_classifier = dgcnn.to(device), row_classifier.to(device), col_classifier.to(device)
         dgcnn, row_classifier, col_classifier = dgcnn.eval(), row_classifier.eval(), col_classifier.eval()
+        count = 0
+        row_prec, col_prec = 0, 0
         for data in tqdm(test_loader):
             features, row_matrix, col_matrix, num_vertices = data['features'].type(torch.FloatTensor), data[
                 'row_matrix'].type(torch.FloatTensor), data['col_matrix'].type(torch.FloatTensor), data['num_vertices']
@@ -339,7 +347,7 @@ def test(args, io):
                 device), num_vertices.to(device)
             logger.info(f'num_vertices shape: {num_vertices.shape}\tdata shape: {data.shape}\trow matrix shape: {row_matrix.shape}\tcol matrix shape: {col_matrix.shape}')
             num_vertices = num_vertices[0]
-            data = data.permute(0,2,1)
+            # data = data.permute(0,2,1)
             batch_size = data.size(0)
             out = dgcnn(data)  # (batch_size, 256, num_points)
             out = out[:, :, :num_vertices]  # (batch_size, 256, num_vertices)
@@ -374,8 +382,12 @@ def test(args, io):
             # compare with ground truth row matrix and column matrix
             gt_row_matrix, gt_col_matrix = row_matrix[:, :num_vertices, :num_vertices], col_matrix[:, :num_vertices, :num_vertices]
 
-            logger.success(f'row matrix precision: {torch.true_divide(torch.sum(torch.eq(gt_row_matrix, pred_row_matrix)), (num_vertices * num_vertices))}\t#relation: {torch.sum(pred_row_matrix)}')
-            logger.success(f'col matrix precision: {torch.true_divide(torch.sum(torch.eq(gt_col_matrix, pred_col_matrix)), (num_vertices * num_vertices))}\t#relation: {torch.sum(pred_col_matrix)}')
+            row_prec = torch.true_divide(torch.sum(torch.eq(gt_row_matrix, pred_row_matrix)), (num_vertices * num_vertices)).item()
+            col_prec = torch.true_divide(torch.sum(torch.eq(gt_col_matrix, pred_col_matrix)), (num_vertices * num_vertices)).item()
+            logger.success(f'row matrix precision: {row_prec}\t#relation: {torch.sum(pred_row_matrix)}')
+            logger.success(f'col matrix precision: {col_prec}\t#relation: {torch.sum(pred_col_matrix)}')
+            count += 1
+        logger.success(f'average row precision: {row_prec}\taverage columm precision: {col_prec}')
 
 
 if __name__ == "__main__":
@@ -394,7 +406,7 @@ if __name__ == "__main__":
                         help='Size of batch)')
     parser.add_argument('--test_batch_size', type=int, default=1, metavar='batch_size',
                         help='Size of batch)')
-    parser.add_argument('--epochs', type=int, default=10, metavar='N',
+    parser.add_argument('--epochs', type=int, default=15, metavar='N',
                         help='number of episode to train ')
     parser.add_argument('--use_sgd', type=bool, default=False,
                         help='Use SGD')
@@ -409,7 +421,7 @@ if __name__ == "__main__":
                         help='enables CUDA training')
     parser.add_argument('--seed', type=int, default=1, metavar='S',
                         help='random seed (default: 1)')
-    parser.add_argument('--eval', type=bool, default=True,
+    parser.add_argument('--eval', type=bool, default=False,
                         help='evaluate the model')
     parser.add_argument('--num_points', type=int, default=512,
                         help='num of points to use')
@@ -426,6 +438,8 @@ if __name__ == "__main__":
     parser.add_argument('--model_path', type=str, default='/home/lihuichao/academic/dgcnn.pytorch/checkpoints/checkpoints_6910', metavar='N',
                         help='The saved model path')
     parser.add_argument('--clear', action='store_true')
+    parser.add_argument('--saved_model_dir', type=str, default='', metavar='N',
+                        help='saved model dir')
     args = parser.parse_args()
 
     _init_()

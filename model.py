@@ -24,8 +24,10 @@ import torch.nn.functional as F
 
 
 def knn(x, k):
-    inner = -2 * torch.matmul(x.transpose(2, 1), x) # (batch_size, feature_size, num_points)
-    xx = torch.sum(x ** 2, dim=1, keepdim=True)
+    # todo: 1. 修改距离公式, 2. normalization。解决办法：新加一个全连接层
+    # multiply feature vector pointwisely
+    inner = -2 * torch.matmul(x.transpose(2, 1), x) # (batch_size, feature_size, num_points) -> (batch_size, num_points, num_points)
+    xx = torch.sum(x ** 2, dim=1, keepdim=True) # (batch_size, 1, num_points)
     pairwise_distance = -xx - inner - xx.transpose(2, 1)
 
     idx = pairwise_distance.topk(k=k, dim=-1)[1]  # (batch_size, num_points, k)
@@ -370,10 +372,13 @@ class DGCNN_semseg(nn.Module):
         self.dp1 = nn.Dropout(p=args.dropout)
         self.conv9 = nn.Conv1d(256, 13, kernel_size=1, bias=False)
 
-    def forward(self, x):
-        batch_size = x.size(0)
-        num_points = x.size(2)
+        self.dense1 = nn.Linear(input_feature_size, input_feature_size)
 
+    def forward(self, x):
+
+        num_points = x.size(1)
+        x = F.relu(self.dense1(x))
+        x = x.permute(0, 2, 1)
         x = get_graph_feature(x, k=self.k,
                               dim9=False)  # (batch_size, 9, num_points) -> (batch_size, 9*2, num_points, k)
         x = self.conv1(x)  # (batch_size, 9*2, num_points, k) -> (batch_size, 64, num_points, k)
