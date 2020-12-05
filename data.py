@@ -208,7 +208,7 @@ def load_scitsr_data(dataset_dir, partition, max_vertice_num=512, feature_size=5
                 feature[i] = chunk['pos'][0], chunk['pos'][1], chunk['pos'][2], chunk['pos'][3], len(chunk['text'])
                 i += 1
         num_points = len(chunks)
-        row_matrix, col_matrix = np.zeros([max_vertice_num, max_vertice_num], dtype=int), np.zeros([max_vertice_num, max_vertice_num], dtype=int)
+        row_matrix, col_matrix = torch.zeros([max_vertice_num, max_vertice_num], dtype=torch.int), torch.zeros([max_vertice_num, max_vertice_num], dtype=torch.int)
         with open(os.path.join(rel_dir, f'{chunk_id}.rel')) as f:
             for line in f:
                 start, end, rel_type = line.split('\t')

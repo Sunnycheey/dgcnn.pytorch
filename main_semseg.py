@@ -17,18 +17,19 @@ import torch.optim as optim
 import sys
 from torch.optim.lr_scheduler import CosineAnnealingLR, StepLR
 from data import S3DIS, SciTSR
-from model import DGCNN_semseg, PairClassfier
+from model import DGCNN_semseg, PairClassfier, DataParallel_wrapper
 import numpy as np
 from torch.utils.data import DataLoader
-from util import cal_loss, IOStream
+from util import cal_loss, IOStream, metric
 import sklearn.metrics as metrics
 import shutil
 from loguru import logger
 from tqdm import tqdm
+from collections import OrderedDict
 
 logger.remove()
 logger.add(sys.stdout, level="INFO")
-
+logger.add('run.log')
 
 def _init_():
     if not os.path.exists('checkpoints'):
@@ -72,13 +73,13 @@ def train(args, io):
         raise Exception("Not implemented")
     print(str(model))
     if args.clear:
-        shutil.rmtree('checkpoints')
-        os.makedirs('checkpoints')
+        shutil.rmtree(args.saved_model_dir)
+        os.makedirs(args.saved_model_dir)
 
-    row_classifier, col_classifier = PairClassfier(512).to(device), PairClassfier(512).to(device)
-    row_classifier, col_classifier = nn.DataParallel(row_classifier), nn.DataParallel(col_classifier)
+    row_classifier, col_classifier = PairClassfier(512), PairClassfier(512)
+    # row_classifier, col_classifier = nn.DataParallel(row_classifier), nn.DataParallel(col_classifier)
 
-    model = nn.DataParallel(model)
+    # model = nn.DataParallel(model)
 
     print("Let's use", torch.cuda.device_count(), "GPUs!")
     params = list(model.parameters()) + list(row_classifier.parameters()) + list(col_classifier.parameters())
@@ -96,143 +97,150 @@ def train(args, io):
         scheduler = StepLR(opt, 20, 0.5, args.epochs)
     iterate_step = 0
     # best_test_iou = 0
+    data_paraller = DataParallel_wrapper(model, row_classifier, col_classifier)
+    data_paraller.to(device)
+    data_paraller = nn.DataParallel(data_paraller)
     for epoch in tqdm(range(args.epochs)):
         ####################
         # Train
         ####################
         train_loss = 0.0
         count = 0.0
-        model.train()
-        row_classifier.train()
-        col_classifier.train()
+        data_paraller.train()
+        # model.train()
+        # row_classifier.train()
+        # col_classifier.train()
         for data in tqdm(train_loader):
             iterate_step += 1
             features, row_matrix, col_matrix, num_vertices = data['features'].type(torch.FloatTensor), data[
-                'row_matrix'].type(torch.FloatTensor), data['col_matrix'].type(torch.FloatTensor), data['num_vertices']
-            data, row_matrix, col_matrix, num_vertices = features.to(device), row_matrix.to(device), col_matrix.to(
-                device), num_vertices.to(device)
+                'row_matrix'], data['col_matrix'], data['num_vertices']
+            # data, row_matrix, col_matrix, num_vertices = features.to(device), row_matrix.to(device), col_matrix.to(
+            #     device), num_vertices.to(device)
 
             # data = data.permute(0, 2, 1)
-            batch_size = data.size()[0]
+            batch_size = features.size()[0]
             opt.zero_grad()
-            all_features = model(data)  # (batch_size, 256, max_num_vertices)
+            loss = data_paraller(features, row_matrix, col_matrix, num_vertices)
+            loss = loss.sum()
+            # all_features = model(data)  # (batch_size, 256, max_num_vertices)
+            #
+            # non_zero_row = torch.nonzero(row_matrix)
+            # non_zero_col = torch.nonzero(col_matrix)
+            # zero_row = torch.nonzero((row_matrix == 0)).to(device)
+            # zero_col = torch.nonzero((col_matrix == 0)).to(device)
+            # row_point1 = all_features[non_zero_row[:, 0], :, non_zero_row[:, 1]]  # (non_zero, 256)
+            # row_point2 = all_features[non_zero_row[:, 0], :, non_zero_row[:, 2]]
+            # row_input_shape = row_point1.size(0)
+            #
+            # col_point1 = all_features[non_zero_col[:, 0], :, non_zero_col[:, 1]]
+            # col_point2 = all_features[non_zero_col[:, 0], :, non_zero_col[:, 2]]
+            # col_input_shape = col_point1.size(0)
+            #
+            # # row_point3 = torch.zeros([row_input_shape, 256])
+            # # col_point3 = torch.zeros([col_input_shape, 256])
+            # # get negative sampling
+            #
+            # for i, v in enumerate(num_vertices):
+            #     row_batch_idx = (zero_row[:, 0] == i)
+            #     col_batch_idx = (zero_col[:, 0] == i)
+            #     small_than_row = torch.logical_and((zero_row[row_batch_idx][:, 1] < v),
+            #                                        (zero_row[row_batch_idx][:, 2] < v))
+            #     small_than_col = torch.logical_and((zero_col[col_batch_idx][:, 1] < v),
+            #                                        (zero_col[col_batch_idx][:, 2] < v))
+            #
+            #     point3 = all_features[zero_row[row_batch_idx][small_than_row][:, 0], :,
+            #              zero_row[row_batch_idx][small_than_row][:, 1]]
+            #     # point4 = all_features[zero_row[row_batch_idx][small_than_row][:, 0], :, zero_row[row_batch_idx][small_than_row][:, 2]]
+            #
+            #     point5 = all_features[zero_col[col_batch_idx][small_than_col][:, 0], :,
+            #              zero_col[col_batch_idx][small_than_col][:, 1]]
+            #     # point6 = all_features[zero_col[col_batch_idx][small_than_col][:, 0], :, zero_col[col_batch_idx][small_than_col][:, 2]]
+            #     if i == 0:
+            #         row_point3 = point3
+            #         # row_point4 = point4
+            #         col_point3 = point5
+            #         # col_point4 = point6
+            #     else:
+            #         row_point3 = torch.cat((row_point3, point3), dim=0)
+            #         # row_point4 = torch.cat((row_point4, point4), dim=0)
+            #         col_point3 = torch.cat((col_point3, point5), dim=0)
+            #         # col_point4 = torch.cat((col_point4, point6), dim=0)
+            #
+            # row_zero_shape = row_point3.size(0)
+            # col_zero_shape = col_point3.size(0)
+            # # col_point3 = all_features[zero_col[:, 0], :, zero_col[:, 1]]
+            # # col_point4 = all_features[zero_col[:, 0], :, zero_col[:, 2]]
+            # row_weights = torch.ones([row_zero_shape])
+            # col_weights = torch.ones([col_zero_shape])
+            #
+            # logger.debug(f'shape of row_weights: {row_weights.shape}')
+            # logger.debug(f'shape of row_input_shape: {row_input_shape}')
+            # # sampling negative samples from original matrix
+            # row_sampling = torch.multinomial(row_weights,
+            #                                  row_input_shape) if row_zero_shape > row_input_shape else torch.arange(
+            #     row_zero_shape)
+            # col_sampling = torch.multinomial(col_weights,
+            #                                  col_input_shape) if col_zero_shape > col_input_shape else torch.arange(
+            #     col_zero_shape)
+            #
+            # logger.debug(f'row sampling shape: {row_sampling.shape}')
+            # logger.debug(f'row point3 shape: {row_point3.shape}')
+            #
+            # # when #negative sampling examples is smaller than positive number, we need to expand negative example
+            # # a sample strategy is to padding negative vector with zeros
+            #
+            # row_neg_point = torch.zeros([row_input_shape, 256]).to(device)
+            # if row_input_shape > row_sampling.size(0):
+            #     logger.warning(f'row negative sampling padding with zero vector')
+            # row_neg_point[:row_sampling.size(0)] = row_point3[row_sampling]
+            #
+            # # row_point4 = row_point4[:row_input_shape] if row_point4.size(0) > (row_input_shape) else row_point4
+            # col_neg_point = torch.zeros([col_input_shape, 256]).to(device)
+            # if col_input_shape > col_sampling.size(0):
+            #     logger.warning(f'col negative sampling padding with zero vector')
+            # col_neg_point[:col_sampling.size(0)] = col_point3[col_sampling]
+            # # col_point4 = col_point4[:col_input_shape] if col_point4.size(0) > (col_input_shape) else col_point4
+            #
+            # # Todo: sampling from row and col
+            #
+            # # predict relation between row point & col point
+            #
+            # row_pos_input = torch.cat((row_point1, row_point2), 1)
+            #
+            # row_neg_input1, row_neg_input2 = torch.cat((row_neg_point, row_point1), 1), torch.cat(
+            #     (row_neg_point, row_point2),
+            #     1)
+            # row_neg_input = torch.cat((row_neg_input1, row_neg_input2), 0)
+            #
+            # col_pos_input = torch.cat((col_point1, col_point2), 1)
+            # col_neg_input1, col_neg_input2 = torch.cat((col_neg_point, col_point1), 1), torch.cat(
+            #     (col_neg_point, col_point2),
+            #     1)
+            # col_neg_input = torch.cat((col_neg_input1, col_neg_input2), 0)
+            # row_input = torch.cat((row_pos_input, row_neg_input), 0)
+            # col_input = torch.cat((col_pos_input, col_neg_input), 0)
+            #
+            # row_pos_gt, row_neg_gt = torch.ones([row_input_shape], dtype=torch.long), torch.zeros(
+            #     [row_neg_input.size(0)],
+            #     dtype=torch.long)
+            # col_pos_gt, col_neg_gt = torch.ones([col_input_shape], dtype=torch.long), torch.zeros(
+            #     [col_neg_input.size(0)],
+            #     dtype=torch.long)
+            #
+            # row_pos_gt, row_neg_gt = row_pos_gt.to(device), row_neg_gt.to(device)
+            # col_pos_gt, col_neg_gt = col_pos_gt.to(device), col_neg_gt.to(device)
+            # row_gt = torch.cat((row_pos_gt, row_neg_gt), 0)
+            # col_gt = torch.cat((col_pos_gt, col_neg_gt), 0)
+            #
+            # # print(f'col gt shape: {col_gt.shape}')
+            #
+            # # g = classifier(row_input)
+            # row_output = F.softmax(row_classifier(row_input), 1)
+            # col_output = F.softmax(col_classifier(col_input), 1)
+            #
+            # loss = F.cross_entropy(row_output, row_gt) + F.cross_entropy(col_output, col_gt)
 
-            non_zero_row = torch.nonzero(row_matrix)
-            non_zero_col = torch.nonzero(col_matrix)
-            zero_row = torch.nonzero((row_matrix == 0)).to(device)
-            zero_col = torch.nonzero((col_matrix == 0)).to(device)
-            row_point1 = all_features[non_zero_row[:, 0], :, non_zero_row[:, 1]]  # (non_zero, 256)
-            row_point2 = all_features[non_zero_row[:, 0], :, non_zero_row[:, 2]]
-            row_input_shape = row_point1.size(0)
-
-            col_point1 = all_features[non_zero_col[:, 0], :, non_zero_col[:, 1]]
-            col_point2 = all_features[non_zero_col[:, 0], :, non_zero_col[:, 2]]
-            col_input_shape = col_point1.size(0)
-
-            # row_point3 = torch.zeros([row_input_shape, 256])
-            # col_point3 = torch.zeros([col_input_shape, 256])
-            # get negative sampling
-
-            for i, v in enumerate(num_vertices):
-                row_batch_idx = (zero_row[:, 0] == i)
-                col_batch_idx = (zero_col[:, 0] == i)
-                small_than_row = torch.logical_and((zero_row[row_batch_idx][:, 1] < v),
-                                                   (zero_row[row_batch_idx][:, 2] < v))
-                small_than_col = torch.logical_and((zero_col[col_batch_idx][:, 1] < v),
-                                                   (zero_col[col_batch_idx][:, 2] < v))
-
-                point3 = all_features[zero_row[row_batch_idx][small_than_row][:, 0], :,
-                         zero_row[row_batch_idx][small_than_row][:, 1]]
-                # point4 = all_features[zero_row[row_batch_idx][small_than_row][:, 0], :, zero_row[row_batch_idx][small_than_row][:, 2]]
-
-                point5 = all_features[zero_col[col_batch_idx][small_than_col][:, 0], :,
-                         zero_col[col_batch_idx][small_than_col][:, 1]]
-                # point6 = all_features[zero_col[col_batch_idx][small_than_col][:, 0], :, zero_col[col_batch_idx][small_than_col][:, 2]]
-                if i == 0:
-                    row_point3 = point3
-                    # row_point4 = point4
-                    col_point3 = point5
-                    # col_point4 = point6
-                else:
-                    row_point3 = torch.cat((row_point3, point3), dim=0)
-                    # row_point4 = torch.cat((row_point4, point4), dim=0)
-                    col_point3 = torch.cat((col_point3, point5), dim=0)
-                    # col_point4 = torch.cat((col_point4, point6), dim=0)
-
-            row_zero_shape = row_point3.size(0)
-            col_zero_shape = col_point3.size(0)
-            # col_point3 = all_features[zero_col[:, 0], :, zero_col[:, 1]]
-            # col_point4 = all_features[zero_col[:, 0], :, zero_col[:, 2]]
-            row_weights = torch.ones([row_zero_shape])
-            col_weights = torch.ones([col_zero_shape])
-
-            logger.debug(f'shape of row_weights: {row_weights.shape}')
-            logger.debug(f'shape of row_input_shape: {row_input_shape}')
-            # sampling negative samples from original matrix
-            row_sampling = torch.multinomial(row_weights,
-                                             row_input_shape) if row_zero_shape > row_input_shape else torch.arange(
-                row_zero_shape)
-            col_sampling = torch.multinomial(col_weights,
-                                             col_input_shape) if col_zero_shape > col_input_shape else torch.arange(
-                col_zero_shape)
-
-            logger.debug(f'row sampling shape: {row_sampling.shape}')
-            logger.debug(f'row point3 shape: {row_point3.shape}')
-
-            # when #negative sampling examples is smaller than positive number, we need to expand negative example
-            # a sample strategy is to padding negative vector with zeros
-
-            row_neg_point = torch.zeros([row_input_shape, 256]).to(device)
-            if row_input_shape > row_sampling.size(0):
-                logger.warning(f'row negative sampling padding with zero vector')
-            row_neg_point[:row_sampling.size(0)] = row_point3[row_sampling]
-
-            # row_point4 = row_point4[:row_input_shape] if row_point4.size(0) > (row_input_shape) else row_point4
-            col_neg_point = torch.zeros([col_input_shape, 256]).to(device)
-            if col_input_shape > col_sampling.size(0):
-                logger.warning(f'col negative sampling padding with zero vector')
-            col_neg_point[:col_sampling.size(0)] = col_point3[col_sampling]
-            # col_point4 = col_point4[:col_input_shape] if col_point4.size(0) > (col_input_shape) else col_point4
-
-            # Todo: sampling from row and col
-
-            # predict relation between row point & col point
-
-            row_pos_input = torch.cat((row_point1, row_point2), 1)
-
-            row_neg_input1, row_neg_input2 = torch.cat((row_neg_point, row_point1), 1), torch.cat(
-                (row_neg_point, row_point2),
-                1)
-            row_neg_input = torch.cat((row_neg_input1, row_neg_input2), 0)
-
-            col_pos_input = torch.cat((col_point1, col_point2), 1)
-            col_neg_input1, col_neg_input2 = torch.cat((col_neg_point, col_point1), 1), torch.cat(
-                (col_neg_point, col_point2),
-                1)
-            col_neg_input = torch.cat((col_neg_input1, col_neg_input2), 0)
-            row_input = torch.cat((row_pos_input, row_neg_input), 0)
-            col_input = torch.cat((col_pos_input, col_neg_input), 0)
-
-            row_pos_gt, row_neg_gt = torch.ones([row_input_shape], dtype=torch.long), torch.zeros(
-                [row_neg_input.size(0)],
-                dtype=torch.long)
-            col_pos_gt, col_neg_gt = torch.ones([col_input_shape], dtype=torch.long), torch.zeros(
-                [col_neg_input.size(0)],
-                dtype=torch.long)
-
-            row_pos_gt, row_neg_gt = row_pos_gt.to(device), row_neg_gt.to(device)
-            col_pos_gt, col_neg_gt = col_pos_gt.to(device), col_neg_gt.to(device)
-            row_gt = torch.cat((row_pos_gt, row_neg_gt), 0)
-            col_gt = torch.cat((col_pos_gt, col_neg_gt), 0)
-
-            # print(f'col gt shape: {col_gt.shape}')
-
-            # g = classifier(row_input)
-            row_output = F.softmax(row_classifier(row_input), 1)
-            col_output = F.softmax(col_classifier(col_input), 1)
-
-            loss = F.cross_entropy(row_output, row_gt) + F.cross_entropy(col_output, col_gt)
-            logger.info(f'loss: {loss}')
+            logger.info(f'loss value: {loss.item()}')
             loss.backward()
             opt.step()
             # pred = seg_pred.max(dim=2)[1]  # (batch_size, num_points)
@@ -328,24 +336,33 @@ def test(args, io):
 
         device = torch.device("cuda" if args.cuda else "cpu")
         dgcnn = DGCNN_semseg(args, 5).to(device)
-        dgcnn = nn.DataParallel(dgcnn)
-        model_dict = torch.load(args.model_path)
+        # dgcnn = nn.DataParallel(dgcnn)
+        state_dict = torch.load(args.model_path)
+        logger.info(state_dict.keys())
+        # create new OrderedDict that does not contain `module.`
+        model_dict = state_dict
+        # for k, v in state_dict.items():
+        #     name = k[7:]  # remove `module.`
+        #     model_dict[name] = v
+        # logger.info(model_dict.keys())
         dgcnn.load_state_dict(model_dict['dgcnn'])
         row_classifier, col_classifier = PairClassfier(512), PairClassfier(512)
-        row_classifier, col_classifier = nn.DataParallel(row_classifier), nn.DataParallel(col_classifier)
+        # row_classifier, col_classifier = nn.DataParallel(row_classifier), nn.DataParallel(col_classifier)
         row_classifier.load_state_dict(model_dict['row_classifier'])
         col_classifier.load_state_dict(model_dict['col_classifier'])
         print(row_classifier)
         dgcnn, row_classifier, col_classifier = dgcnn.to(device), row_classifier.to(device), col_classifier.to(device)
         dgcnn, row_classifier, col_classifier = dgcnn.eval(), row_classifier.eval(), col_classifier.eval()
         count = 0
-        row_prec, col_prec = 0, 0
+        row_TP, row_FP, row_FN, col_TP, col_FP, col_FN = 0, 0, 0, 0, 0, 0
+        row_macro_precision, row_macro_recall, col_macro_precision, col_macro_recall = [], [], [], []
         for data in tqdm(test_loader):
             features, row_matrix, col_matrix, num_vertices = data['features'].type(torch.FloatTensor), data[
-                'row_matrix'].type(torch.FloatTensor), data['col_matrix'].type(torch.FloatTensor), data['num_vertices']
+                'row_matrix'], data['col_matrix'], data['num_vertices']
             data, row_matrix, col_matrix, num_vertices = features.to(device), row_matrix.to(device), col_matrix.to(
                 device), num_vertices.to(device)
-            logger.info(f'num_vertices shape: {num_vertices.shape}\tdata shape: {data.shape}\trow matrix shape: {row_matrix.shape}\tcol matrix shape: {col_matrix.shape}')
+            logger.info(f'num_vertices value: {num_vertices[0].item()}\tdata shape: {data.shape}\trow matrix shape: {row_matrix.shape}\tcol matrix shape: {col_matrix.shape}')
+            logger.info(f'input features: {data}')
             num_vertices = num_vertices[0]
             # data = data.permute(0,2,1)
             batch_size = data.size(0)
@@ -380,14 +397,35 @@ def test(args, io):
             pred_col_matrix[r_col_idx, c_col_idx] = 1
 
             # compare with ground truth row matrix and column matrix
-            gt_row_matrix, gt_col_matrix = row_matrix[:, :num_vertices, :num_vertices], col_matrix[:, :num_vertices, :num_vertices]
+            gt_row_matrix, gt_col_matrix = row_matrix[0, :num_vertices, :num_vertices], col_matrix[0, :num_vertices, :num_vertices]
+            # pred_row_matrix, pred_col_matrix, gt_row_matrix, gt_col_matrix = pred_row_matrix.cpu(), pred_col_matrix.cpu(), gt_row_matrix.cpu(), gt_col_matrix.cpu()
+            # unpack value according to util.metric TP, FP, FN, precision, recall, correct_relations, exists_relations
+            r1, r2, r3, r4, r5, r6, r7 = metric(pred_row_matrix, gt_row_matrix)
+            c1, c2, c3, c4, c5, c6, c7 = metric(pred_col_matrix, gt_col_matrix)
+            row_TP += r1
+            row_FP += r2
+            row_FN += r3
+            row_macro_precision.append(r4)
+            row_macro_recall.append(r5)
+
+            col_TP += c1
+            col_FP += c2
+            col_FN += c3
+            col_macro_precision.append(c4)
+            col_macro_recall.append(c5)
 
             row_prec = torch.true_divide(torch.sum(torch.eq(gt_row_matrix, pred_row_matrix)), (num_vertices * num_vertices)).item()
             col_prec = torch.true_divide(torch.sum(torch.eq(gt_col_matrix, pred_col_matrix)), (num_vertices * num_vertices)).item()
-            logger.success(f'row matrix precision: {row_prec}\t#relation: {torch.sum(pred_row_matrix)}')
-            logger.success(f'col matrix precision: {col_prec}\t#relation: {torch.sum(pred_col_matrix)}')
+            logger.info(f'tp: {row_TP}\tfp: {row_FP}')
             count += 1
-        logger.success(f'average row precision: {row_prec}\taverage columm precision: {col_prec}')
+        row_macro_precision, row_macro_recall = np.array(row_macro_precision), np.array(row_macro_recall)
+        col_macro_precision, col_macro_recall = np.array(col_macro_precision), np.array(col_macro_recall)
+
+        logger.success(f'[row]: macro precision: {np.average(row_macro_precision)}\tmacro recall: {np.average(row_macro_recall)}')
+        logger.success(f'[row]: micro precision: {row_TP / (row_TP + row_FP)}\tmicro recall: {row_TP / (row_TP + row_FN)}')
+        logger.success(f'[col]: macro precision: {np.average(col_macro_precision)}\tmacro recall: {np.average(col_macro_recall)}')
+        logger.success(f'[col]: micro precision: {col_TP / (col_TP + col_FP)}\tmicro recall: {col_TP / (col_TP + col_FN)}')
+        # logger.success(f'average row precision: {row_prec}\taverage columm precision: {col_prec}')
 
 
 if __name__ == "__main__":
@@ -402,7 +440,7 @@ if __name__ == "__main__":
                         choices=['S3DIS'])
     parser.add_argument('--test_area', type=str, default=None, metavar='N',
                         choices=['1', '2', '3', '4', '5', '6', 'all'])
-    parser.add_argument('--batch_size', type=int, default=16, metavar='batch_size',
+    parser.add_argument('--batch_size', type=int, default=24, metavar='batch_size',
                         help='Size of batch)')
     parser.add_argument('--test_batch_size', type=int, default=1, metavar='batch_size',
                         help='Size of batch)')
@@ -433,9 +471,9 @@ if __name__ == "__main__":
                         help='Num of nearest neighbors to use')
     parser.add_argument('--model_root', type=str, default='', metavar='N',
                         help='Pretrained model root')
-    parser.add_argument('--save_step', type=int, default=600, metavar='N',
+    parser.add_argument('--save_step', type=int, default=150, metavar='N',
                         help='Pretrained model root')
-    parser.add_argument('--model_path', type=str, default='/home/lihuichao/academic/dgcnn.pytorch/checkpoints/checkpoints_6910', metavar='N',
+    parser.add_argument('--model_path', type=str, default='/home/lihuichao/academic/dgcnn.pytorch/checkpoints_paraller/checkpoints_750', metavar='N',
                         help='The saved model path')
     parser.add_argument('--clear', action='store_true')
     parser.add_argument('--saved_model_dir', type=str, default='', metavar='N',
