@@ -23,32 +23,64 @@ import torch.nn.init as init
 import torch.nn.functional as F
 from loguru import logger
 
-logger.add('run.log')
+logger.add('single_batch_run.log')
 
-def knn(x, k):
+
+def knn(x, k, dim_expand=False):
     # todo: 1. 修改距离公式, 2. normalization。解决办法：新加一个全连接层
     # multiply feature vector pointwisely
-    inner = -2 * torch.matmul(x.transpose(2, 1),
-                              x)  # (batch_size, feature_size, num_points) -> (batch_size, num_points, num_points)
-    xx = torch.sum(x ** 2, dim=1, keepdim=True)  # (batch_size, 1, num_points)
-    pairwise_distance = -xx - inner - xx.transpose(2, 1)
-    idx = pairwise_distance.topk(k=k, dim=-1)[1]  # (batch_size, num_points, k)
-    return idx
+    # x: (batch_size, feature_size, num_points)
+    batch_size = x.size(0)
+    num_points = x.size(2)
+    device = torch.device('cuda')
+    if dim_expand:
+        if k > num_points:
+            incr_list = torch.arange(num_points, device=device,dtype=torch.int)
+            ret = torch.zeros([batch_size, num_points, num_points], device=device,dtype=torch.int)
+            ret[:, :] = incr_list
+            return ret
+        x1, y1 = x[:, 0, :].unsqueeze(2), x[:, 2, :].unsqueeze(2)  # (batch_size, num_points, 1)
+        dis_x, dis_y = x1.transpose(2, 1), y1.transpose(2, 1)
+        x1, y1 = x1.expand(batch_size, num_points, num_points), y1.expand(batch_size, num_points, num_points)
+        pairwise_x, pairwise_y = (x1 - dis_x).abs(), (y1 - dis_y).abs()
+        pairwise_distance = pairwise_x + pairwise_y
+        # todo: 去掉自己和自己的连接
+        # todo: 解决topk invalid index报错
+        # idx_x, idx_y = torch.topk(pairwise_x, k=k, dim=-1, largest=False)[1], \
+        #                torch.topk(pairwise_y, k, dim=-1, largest=False)[1]
+        idx = torch.topk(pairwise_distance, k=k, dim=-1, largest=False)[1]
+        # idx = torch.cat((idx_x, idx_y), dim=-1)
+        return idx
+
+    else:
+        if k > num_points:
+            incr_list = torch.arange(num_points, device=device,dtype=torch.int)
+            ret = torch.zeros([batch_size, num_points, num_points], device=device,dtype=torch.int)
+            ret[:, :] = incr_list
+            return ret
+        inner = -2 * torch.matmul(x.transpose(2, 1),
+                                  x)  # (batch_size, feature_size, num_points) -> (batch_size, num_points, num_points)
+        xx = torch.sum(x ** 2, dim=1, keepdim=True)  # (batch_size, 1, num_points)
+        pairwise_distance = -xx - inner - xx.transpose(2, 1)
+        idx = pairwise_distance.topk(k=k, dim=-1)[1]  # (batch_size, num_points, k)
+        return idx
 
 
-def get_graph_feature(x, k=20, idx=None, dim9=False):
+@logger.catch
+def get_graph_feature(x, k=30, idx=None, dim_expand=False):
     batch_size = x.size(0)
     num_points = x.size(2)
     x = x.view(batch_size, -1, num_points)
     if idx is None:
-        if dim9 == False:
+        if not dim_expand:
             idx = knn(x, k=k)  # (batch_size, num_points, k)
         else:
-            idx = knn(x[:, 6:], k=k)
+            idx = knn(x[:, :4], k=k, dim_expand=True)
     device = torch.device('cuda')
 
     idx_base = torch.arange(0, batch_size, device=device).view(-1, 1, 1) * num_points
 
+    idx = idx.to(device)
     idx = idx + idx_base
 
     idx = idx.view(-1)
@@ -58,8 +90,13 @@ def get_graph_feature(x, k=20, idx=None, dim9=False):
     x = x.transpose(2,
                     1).contiguous()  # (batch_size, num_points, num_dims)  -> (batch_size*num_points, num_dims) #   batch_size * num_points * k + range(0, batch_size*num_points)
     feature = x.view(batch_size * num_points, -1)[idx, :]
-    feature = feature.view(batch_size, num_points, k, num_dims)
-    x = x.view(batch_size, num_points, 1, num_dims).repeat(1, 1, k, 1)
+
+
+    feature = feature.view(batch_size, num_points, -1, num_dims)
+
+    actual_k = feature.size(2)
+
+    x = x.view(batch_size, num_points, 1, num_dims).repeat(1, 1, actual_k, 1)
 
     feature = torch.cat((feature - x, x), dim=3).permute(0, 3, 1, 2).contiguous()
 
@@ -333,7 +370,7 @@ class PairClassfier(nn.Module):
 
 class DGCNN_semseg(nn.Module):
     # Todo: train model on parallel, ref: https://discuss.pytorch.org/t/dataparallel-imbalanced-memory-usage/22551/12
-    def __init__(self, args, input_feature_size=3):
+    def __init__(self, args, input_feature_size=14):
         super(DGCNN_semseg, self).__init__()
         self.args = args
         self.k = args.k
@@ -374,14 +411,13 @@ class DGCNN_semseg(nn.Module):
         self.dp1 = nn.Dropout(p=args.dropout)
         self.conv9 = nn.Conv1d(256, 13, kernel_size=1, bias=False)
 
-        self.dense1 = nn.Linear(input_feature_size, input_feature_size)
+        # self.dense1 = nn.Linear(input_feature_size, input_feature_size)
 
     def forward(self, x):
         num_points = x.size(1)
-        x = F.relu(self.dense1(x))
         x = x.permute(0, 2, 1)
         x = get_graph_feature(x, k=self.k,
-                              dim9=False)  # (batch_size, 9, num_points) -> (batch_size, 9*2, num_points, k)
+                              dim_expand=True)  # (batch_size, 9, num_points) -> (batch_size, 9*2, num_points, k)
         x = self.conv1(x)  # (batch_size, 9*2, num_points, k) -> (batch_size, 64, num_points, k)
         x = self.conv2(x)  # (batch_size, 64, num_points, k) -> (batch_size, 64, num_points, k)
         x1 = x.max(dim=-1, keepdim=False)[0]  # (batch_size, 64, num_points, k) -> (batch_size, 64, num_points)
@@ -421,12 +457,14 @@ class DataParallel_wrapper(nn.Module):
     def forward(self, data, row_matrix, col_matrix, num_vertices):
 
         all_features = self.model(data)  # (batch_size, 256, max_num_vertices)
+        logger.debug(f'all features: {all_features.permute(0,2,1)}')
         batch_size = all_features.size(0)
+        logger.debug(f'num vertices: {num_vertices[0]}')
         # check whether generated features equals to zero vector
         with torch.no_grad():
             for i in range(batch_size):
                 zero_count = torch.sum(all_features[i, :, :num_vertices[i]], dim=1)  # (num_vertices[i])
-                features_all_zero = torch.nonzero(zero_count == 0) # (zero_count * 1)
+                features_all_zero = torch.nonzero(zero_count == 0)  # (zero_count * 1)
                 if features_all_zero.size(0) != 0:
                     logger.warning(f'the features of points: {features_all_zero[:, 0]} is all zeros!')
 
@@ -436,6 +474,7 @@ class DataParallel_wrapper(nn.Module):
         zero_col = torch.nonzero((col_matrix == 0))
         row_point1 = all_features[non_zero_row[:, 0], :, non_zero_row[:, 1]]  # (non_zero, 256)
         row_point2 = all_features[non_zero_row[:, 0], :, non_zero_row[:, 2]]
+        logger.debug(f'row point1 shape: {row_point1.shape}')
         row_input_shape = row_point1.size(0)
 
         col_point1 = all_features[non_zero_col[:, 0], :, non_zero_col[:, 1]]
@@ -478,16 +517,23 @@ class DataParallel_wrapper(nn.Module):
         # col_point4 = all_features[zero_col[:, 0], :, zero_col[:, 2]]
         row_weights = torch.ones([row_zero_shape])
         col_weights = torch.ones([col_zero_shape])
-
+        logger.debug(f'row point1 shape: {row_point1.shape}')
+        logger.debug(f'{row_point1}')
         logger.debug(f'shape of row_weights: {row_weights.shape}')
         logger.debug(f'shape of row_input_shape: {row_input_shape}')
         # sampling negative samples from original matrix
-        row_sampling = torch.multinomial(row_weights,
-                                         row_input_shape) if row_zero_shape > row_input_shape else torch.arange(
-            row_zero_shape)
-        col_sampling = torch.multinomial(col_weights,
-                                         col_input_shape) if col_zero_shape > col_input_shape else torch.arange(
-            col_zero_shape)
+        if row_input_shape == 0:
+            row_sampling = torch.LongTensor([])
+        else:
+            row_sampling = torch.multinomial(row_weights,
+                                             row_input_shape) if row_zero_shape > row_input_shape else torch.arange(
+                row_zero_shape)
+        if col_input_shape == 0:
+            col_sampling = torch.LongTensor([])
+        else:
+            col_sampling = torch.multinomial(col_weights,
+                                             col_input_shape) if col_zero_shape > col_input_shape else torch.arange(
+                col_zero_shape)
 
         logger.debug(f'row sampling shape: {row_sampling.shape}')
         logger.debug(f'row point3 shape: {row_point3.shape}')
@@ -540,13 +586,18 @@ class DataParallel_wrapper(nn.Module):
         row_input, col_input = row_input[row_shuffle], col_input[col_shuffle]
         row_gt, col_gt = row_gt[row_shuffle], col_gt[col_shuffle]
 
-        row_output = F.softmax(self.row_classifier(row_input), 1)
-        col_output = F.softmax(self.col_classifier(col_input), 1)
+        logger.debug(f'row input: {row_input}')
+        logger.debug(f'row gt: {row_gt}')
+        row_output = self.row_classifier(row_input)
+        col_output = self.col_classifier(col_input)
+        # row_output = F.softmax(self.row_classifier(row_input), 1)
+        # col_output = F.softmax(self.col_classifier(col_input), 1)
 
         loss = F.cross_entropy(row_output, row_gt) + F.cross_entropy(col_output, col_gt)
         # logger.info(f'loss shape: {loss.shape}\tloss value: {loss}')
         # loss = self.loss(outputs, targets)
         return torch.unsqueeze(loss, 0)
+
 
 # def DataParallel_withLoss(model, loss, **kwargs):
 #     model = DataParallel_wrapper(model, loss)
@@ -564,3 +615,9 @@ class DataParallel_wrapper(nn.Module):
 #     else:
 #         model = torch.nn.DataParallel(model, device_ids=device_ids, output_device=output_device).cuda()
 #     return model
+
+if __name__ == '__main__':
+    a = torch.rand([5, 4, 6])
+    print(a)
+    # print(get_graph_feature(a, 3, dim_expand=True))
+    print(knn(a, 5, dim_expand=False))

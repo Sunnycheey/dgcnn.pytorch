@@ -182,7 +182,16 @@ def rotate_pointcloud(pointcloud):
     return pointcloud
 
 
-def load_scitsr_data(dataset_dir, partition, max_vertice_num=512, feature_size=5):
+def load_scitsr_data(dataset_dir, partition, padding=False, max_vertice_num=512, feature_size=15):
+    """
+    load scitsr dataset
+    :param dataset_dir: dataset dir path
+    :param partition: partition of dataset: train or test
+    :param padding: whether padding the dataset with max_vertice_num
+    :param max_vertice_num: the padding size for dataset
+    :param feature_size: input feature size
+    :return: the loaded dataset
+    """
     import json
 
     data, row_matrices, col_matrices = [], [], []
@@ -194,21 +203,27 @@ def load_scitsr_data(dataset_dir, partition, max_vertice_num=512, feature_size=5
     for chunk_file_path in os.listdir(chunk_dir):
         if chunk_file_path.endswith('.ipynb_checkpoints'):
             continue
-        feature = np.zeros([max_vertice_num, feature_size])
         chunk_id = chunk_file_path.split('.')[0:-1]
         chunk_id = '.'.join(chunk_id)
         with open(os.path.join(chunk_dir, chunk_file_path)) as f:
             obj = json.load(f)
             chunks = obj['chunks']
-            if len(chunks) > max_vertice_num:
-                # Todo: 处理chunk数大于max_vertice_num的情况
+            num_points = len(chunks)
+            coords = np.zeros([max_vertice_num, 4]) if padding else np.zeros([num_points, 4])
+            chunk_text = []
+            if num_points > max_vertice_num and padding:
                 continue
             i = 0
             for chunk in chunks:
-                feature[i] = chunk['pos'][0], chunk['pos'][1], chunk['pos'][2], chunk['pos'][3], len(chunk['text'])
+                coords[i] = chunk['pos'][0], chunk['pos'][1], chunk['pos'][2], chunk['pos'][3]
+                chunk_text.append(chunk['text'])
                 i += 1
-        num_points = len(chunks)
-        row_matrix, col_matrix = torch.zeros([max_vertice_num, max_vertice_num], dtype=torch.int), torch.zeros([max_vertice_num, max_vertice_num], dtype=torch.int)
+        if padding:
+            row_matrix, col_matrix = torch.zeros([max_vertice_num, max_vertice_num], dtype=torch.int), torch.zeros(
+                [max_vertice_num, max_vertice_num], dtype=torch.int)
+        else:
+            row_matrix, col_matrix = torch.zeros([num_points, num_points], dtype=torch.int), torch.zeros(
+                [num_points, num_points], dtype=torch.int)
         with open(os.path.join(rel_dir, f'{chunk_id}.rel')) as f:
             for line in f:
                 start, end, rel_type = line.split('\t')
@@ -220,7 +235,27 @@ def load_scitsr_data(dataset_dir, partition, max_vertice_num=512, feature_size=5
                 elif rel_type == '2':
                     col_matrix[start, end] = 1
                     col_matrix[end, start] = 1
-        data.append({'features': np.array(feature), 'row_matrix': row_matrix, 'col_matrix': col_matrix, 'num_vertices': num_points})
+        # if padding:
+        #     data.append({'features': np.array(feature), 'row_matrix': row_matrix, 'col_matrix': col_matrix, 'num_vertices': num_points})
+        # else:
+        coords = torch.from_numpy(coords)
+        tab_w, tab_h = coords[:, 1].max() - coords[:, 0].min(), coords[:, 3].max() - coords[:, 2].min()
+        x_center, y_center = (coords[:, 0] + coords[:, 1]) / 2, (coords[:, 2] + coords[:, 3]) / 2
+        relative_x1, relative_x2, relative_y1, relative_y2 = coords[:, 0] / tab_w, coords[:, 1] / tab_w, coords[
+                                                                                                         :,2] / tab_h, coords[
+                                                                                                                      :,3] / tab_h
+        relative_x_center, relative_y_center = (coords[:, 0] + coords[:, 1]) / 2 / tab_w, (
+                    coords[:, 2] + coords[:, 3]) / 2 / tab_h
+        height_of_chunk, width_of_chunk = coords[:, 3] - coords[:, 2], coords[:, 1] - coords[:, 0]
+        # tab_w_list, tab_h_list = np.zeros([])
+        x_center, y_center, relative_x1, relative_x2, relative_y1, relative_y2, relative_x_center, relative_y_center, height_of_chunk, width_of_chunk = \
+            x_center.unsqueeze(1), y_center.unsqueeze(1), relative_x1.unsqueeze(1), relative_x2.unsqueeze(1), relative_y1.unsqueeze(1), relative_y2.unsqueeze(1), relative_x_center.unsqueeze(1), relative_y_center.unsqueeze(1), height_of_chunk.unsqueeze(1), width_of_chunk.unsqueeze(1)
+        feature = torch.cat((coords, x_center, y_center, relative_x1, relative_x2, relative_y1,
+                                  relative_y2, relative_x_center, relative_y_center, height_of_chunk, width_of_chunk),
+                                 dim=1)
+        data.append({'file_path': chunk_file_path, 'features': feature, 'row_matrix': row_matrix,
+                     'col_matrix': col_matrix, 'num_vertices': num_points})
+
     return data
 
 
@@ -243,8 +278,9 @@ class ModelNet40(Dataset):
 
 
 class SciTSR(Dataset):
-    def __init__(self, dataset_dir, max_vertice_num=1024, feature_size=5, partition='train'):
-        self.data = load_scitsr_data(dataset_dir, partition, max_vertice_num)  # data: [num_points * feature_size], row/col_matix: [num_points, num_points]
+    def __init__(self, dataset_dir, max_vertice_num=1024, feature_size=15, partition='train'):
+        self.data = load_scitsr_data(dataset_dir, partition,
+                                     max_vertice_num=max_vertice_num)  # data: [num_points * feature_size], row/col_matix: [num_points, num_points]
         self.feature_size = feature_size
         self.max_vertice_num = max_vertice_num
         self.partition = partition
@@ -317,6 +353,48 @@ class S3DIS(Dataset):
         return self.data.shape[0]
 
 
+class Vertex(object):
+
+    def __init__(self, vid: int, chunk, tab_h, tab_w):
+        """
+    Args:
+      vid: Vertex id
+      chunk: the chunk to extract features
+      tab_h: height of the table (y-axis)
+      tab_w: width of the table (x-axis)
+    """
+        self.tab_h = tab_h
+        self.tab_w = tab_w
+        self.chunk = chunk
+        self.features = self.get_features()
+
+    def get_features(self):
+        return {
+            "x1": self.chunk.x1,
+            "x2": self.chunk.x2,
+            "y1": self.chunk.y1,
+            "y2": self.chunk.y2,
+            "x center": (self.chunk.x1 + self.chunk.x2) / 2,
+            "y center": (self.chunk.y2 + self.chunk.y2) / 2,
+            "relative x1": self.chunk.x1 / self.tab_w,
+            "relative x2": self.chunk.x2 / self.tab_w,
+            "relative y1": self.chunk.y1 / self.tab_h,
+            "relative y2": self.chunk.y2 / self.tab_h,
+            "relative x center": (self.chunk.x1 + self.chunk.x2) / 2 / self.tab_w,
+            "relative y center": (self.chunk.y2 + self.chunk.y2) / 2 / self.tab_h,
+            "height of chunk": self.chunk.y2 - self.chunk.y1,
+            "width of chunk": self.chunk.x2 - self.chunk.x1
+        }
+
+
+class Chunk:
+    def __init__(self, x1, x2, y1, y2):
+        self.x1 = x1
+        self.x2 = x2
+        self.y1 = y1
+        self.y2 = y2
+
+
 if __name__ == '__main__':
     # train = ModelNet40(1024)
     # test = ModelNet40(1024, 'test')
@@ -340,4 +418,3 @@ if __name__ == '__main__':
     scitsr = SciTSR(dataset_dir='/home/lihuichao/academic/SciTSR/dataset')
     data, row_matrix, col_matrix = scitsr[0]
     print(data.shape, row_matrix, col_matrix)
-
