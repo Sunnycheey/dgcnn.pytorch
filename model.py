@@ -592,8 +592,8 @@ class DataParallel_wrapper(nn.Module):
         col_output = self.col_classifier(col_input)
         # row_output = F.softmax(self.row_classifier(row_input), 1)
         # col_output = F.softmax(self.col_classifier(col_input), 1)
-
-        loss = F.cross_entropy(row_output, row_gt) + F.cross_entropy(col_output, col_gt)
+        loss_weights = torch.tensor([0.2, 1]).to('cuda')
+        loss = F.cross_entropy(row_output, row_gt, weight=loss_weights) + F.cross_entropy(col_output, col_gt, weight=loss_weights)
         # logger.info(f'loss shape: {loss.shape}\tloss value: {loss}')
         # loss = self.loss(outputs, targets)
         return torch.unsqueeze(loss, 0)

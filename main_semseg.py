@@ -102,6 +102,18 @@ def train(args, io):
     elif args.scheduler == 'step':
         scheduler = StepLR(opt, 20, 0.5, args.epochs)
     iterate_step = 0
+
+    if args.pretrained_model:
+        model_path = args.pretrained_model
+        iterate_step = int(model_path.split('_')[-1])
+        logger.info(f'start load weights from pretrained model....')
+        model_dict = torch.load(args.pretrained_model)
+        model.load_state_dict(model_dict['dgcnn'])
+        # row_classifier, col_classifier = nn.DataParallel(row_classifier), nn.DataParallel(col_classifier)
+        row_classifier.load_state_dict(model_dict['row_classifier'])
+        col_classifier.load_state_dict(model_dict['col_classifier'])
+        logger.info(f'load successfully!')
+
     # best_test_iou = 0
     data_paraller = DataParallel_wrapper(model, row_classifier, col_classifier)
     data_paraller.to(device)
@@ -177,89 +189,86 @@ def test(args, io):
         row_TP, row_FP, row_FN, col_TP, col_FP, col_FN = 0, 0, 0, 0, 0, 0
         row_macro_precision, row_macro_recall, col_macro_precision, col_macro_recall = [], [], [], []
         for data in tqdm(test_loader):
-            features, row_matrix, col_matrix, num_vertices = data['features'].type(torch.FloatTensor), data[
-                'row_matrix'], data['col_matrix'], data['num_vertices']
-            data, row_matrix, col_matrix, num_vertices = features.to(device), row_matrix.to(device), col_matrix.to(
-                device), num_vertices.to(device)
-            logger.info(
-                f'num_vertices value: {num_vertices[0].item()}\tdata shape: {data.shape}\trow matrix shape: {row_matrix.shape}\tcol matrix shape: {col_matrix.shape}')
-            logger.info(f'input features: {data}')
-            num_vertices = num_vertices[0]
-            # data = data.permute(0,2,1)
-            batch_size = data.size(0)
-            out = dgcnn(data)  # (batch_size, 256, num_points)
-            out = out[:, :, :num_vertices]  # (batch_size, 256, num_vertices)
-            logger.debug(f'output shape: {out.shape}')
-            logger.debug(f'output: {out}')
-            pred_row_matrix = torch.zeros([num_vertices, num_vertices], dtype=torch.int).to(device)
-            pred_col_matrix = torch.zeros([num_vertices, num_vertices], dtype=torch.int).to(device)
-            possible_idx = torch.arange(num_vertices)
-            # concatenate tensor row by column
+            with logger.catch():
+                features, row_matrix, col_matrix, num_vertices = data['features'].type(torch.FloatTensor), data[
+                    'row_matrix'], data['col_matrix'], data['num_vertices']
+                data, row_matrix, col_matrix, num_vertices = features.to(device), row_matrix.to(device), col_matrix.to(
+                    device), num_vertices.to(device)
+                logger.debug(
+                    f'num_vertices value: {num_vertices[0].item()}\tdata shape: {data.shape}\trow matrix shape: {row_matrix.shape}\tcol matrix shape: {col_matrix.shape}')
+                logger.debug(f'input features: {data}')
+                num_vertices = num_vertices[0]
+                # data = data.permute(0,2,1)
+                batch_size = data.size(0)
+                out = dgcnn(data)  # (batch_size, 256, num_points)
+                out = out[:, :, :num_vertices]  # (batch_size, 256, num_vertices)
+                logger.debug(f'output shape: {out.shape}')
+                logger.debug(f'output: {out}')
+                pred_row_matrix = torch.zeros([num_vertices, num_vertices], dtype=torch.int).to(device)
+                pred_col_matrix = torch.zeros([num_vertices, num_vertices], dtype=torch.int).to(device)
+                possible_idx = torch.arange(num_vertices)
+                # concatenate tensor row by column
 
-            # combinations = torch.combinations(possible_idx, r=2)  # (num_vertices, num_vertices)
-            # todo: 生成所有idx
-            possible_idx = range(num_vertices)
-            combinations = torch.LongTensor(list(itertools.product(possible_idx, possible_idx)))
-            row_features1, row_features2 = out[:, :, combinations[:, 0]], out[:, :, combinations[:,
-                                                                                    1]]  # (batch_size, 256, combination(num_vertices,2))
-            col_features1, col_features2 = out[:, :, combinations[:, 0]], out[:, :, combinations[:,
-                                                                                    1]]  # (batch_size, 256, combination(num_vertices, 2))
-            row_features1, row_features2, col_features1, col_features2 = row_features1.to(device), row_features2.to(
-                device), col_features1.to(device), col_features2.to(device)
-            logger.debug(
-                f'num vertices :{num_vertices}\trow1 features shape: {row_features1.shape}\tcol1 features shape: {col_features1.shape}')
-            row_pairs, col_pairs = torch.cat((row_features1, row_features2), 1), torch.cat((col_features1,
-                                                                                            col_features2),
-                                                                                           1)  # (batch_size, 512, combination(num_vertices, 2))
-            logger.debug(f'row pairs shape:  {row_pairs.shape}\tcol pairs shape: {col_pairs.shape}')
-            row_pairs, col_pairs = row_pairs.permute(0, 2, 1), col_pairs.permute(0, 2,
-                                                                                 1)  # (batch_size, combination(num_vertices,2), 512)
-            row_output, col_output = row_classifier(row_pairs), col_classifier(
-                col_pairs)  # (batch_size, combination(num_vertices, 2), 2)
-            logger.debug(f'row output shape: {row_output.shape}')
-            logger.debug(f'row output: {row_output}')
-            # row_output, col_output = row_output.permute(0, 2, 1), col_output.permute(0, 2, 1) # (batch_size, combination(num_vertices,2), 2)
+                # combinations = torch.combinations(possible_idx, r=2)  # (num_vertices, num_vertices)
+                possible_idx = range(num_vertices)
+                combinations = torch.LongTensor(list(itertools.product(possible_idx, possible_idx)))
+                row_features1, row_features2 = out[:, :, combinations[:, 0]], out[:, :, combinations[:,
+                                                                                        1]]  # (batch_size, 256, combination(num_vertices,2))
+                col_features1, col_features2 = out[:, :, combinations[:, 0]], out[:, :, combinations[:,
+                                                                                        1]]  # (batch_size, 256, combination(num_vertices, 2))
+                row_features1, row_features2, col_features1, col_features2 = row_features1.to(device), row_features2.to(
+                    device), col_features1.to(device), col_features2.to(device)
+                logger.debug(
+                    f'num vertices :{num_vertices}\trow1 features shape: {row_features1.shape}\tcol1 features shape: {col_features1.shape}')
+                row_pairs, col_pairs = torch.cat((row_features1, row_features2), 1), torch.cat((col_features1,
+                                                                                                col_features2),
+                                                                                               1)  # (batch_size, 512, combination(num_vertices, 2))
+                logger.debug(f'row pairs shape:  {row_pairs.shape}\tcol pairs shape: {col_pairs.shape}')
+                row_pairs, col_pairs = row_pairs.permute(0, 2, 1), col_pairs.permute(0, 2,
+                                                                                     1)  # (batch_size, combination(num_vertices,2), 512)
+                row_output, col_output = row_classifier(row_pairs), col_classifier(
+                    col_pairs)  # (batch_size, combination(num_vertices, 2), 2)
+                logger.debug(f'row output shape: {row_output.shape}')
+                logger.debug(f'row output: {row_output}')
+                # row_output, col_output = row_output.permute(0, 2, 1), col_output.permute(0, 2, 1) # (batch_size, combination(num_vertices,2), 2)
 
-            row_idx, col_idx = torch.argmax(row_output, 2), torch.argmax(col_output,
-                                                                         2)  # (batch_size, combination(num_vertices, 2))
-            logger.debug(f'row_idx shape: {row_idx.shape}')
-            non_zero_row, non_zero_col = torch.nonzero(row_idx), torch.nonzero(col_idx)  # (non_zero_num, 2)
-            logger.debug(f'non_zero_row shape: {non_zero_row.shape}')
-            r_row_idx, c_row_idx, r_col_idx, c_col_idx = non_zero_row[:, 1] // num_vertices, non_zero_row[:,
-                                                                                             1] % num_vertices, non_zero_col[
-                                                                                                                :,
-                                                                                                                1] // num_vertices, non_zero_col[
-                                                                                                                                    :,
-                                                                                                                                    1] % num_vertices
-            logger.debug(f'pred_row_matrix shape: {pred_row_matrix.shape}\tr_row_id shape: {r_row_idx.shape}')
-            pred_row_matrix[r_row_idx, c_row_idx] = 1
-            pred_col_matrix[r_col_idx, c_col_idx] = 1
+                row_idx, col_idx = torch.argmax(row_output, 2), torch.argmax(col_output,
+                                                                             2)  # (batch_size, combination(num_vertices, 2))
+                logger.debug(f'row_idx shape: {row_idx.shape}')
+                non_zero_row, non_zero_col = torch.nonzero(row_idx), torch.nonzero(col_idx)  # (non_zero_num, 2)
+                logger.debug(f'non_zero_row shape: {non_zero_row.shape}')
+                r_row_idx, c_row_idx, r_col_idx, c_col_idx = non_zero_row[:, 1] // num_vertices, non_zero_row[:,
+                                                                                                 1] % num_vertices, non_zero_col[
+                                                                                                                    :,
+                                                                                                                    1] // num_vertices, non_zero_col[
+                                                                                                                                        :,
+                                                                                                                                        1] % num_vertices
+                logger.debug(f'pred_row_matrix shape: {pred_row_matrix.shape}\tr_row_id shape: {r_row_idx.shape}')
+                pred_row_matrix[r_row_idx, c_row_idx] = 1
+                pred_col_matrix[r_col_idx, c_col_idx] = 1
 
-            # compare with ground truth row matrix and column matrix
-            gt_row_matrix, gt_col_matrix = row_matrix[0, :num_vertices, :num_vertices], col_matrix[0, :num_vertices,
-                                                                                        :num_vertices]
-            # pred_row_matrix, pred_col_matrix, gt_row_matrix, gt_col_matrix = pred_row_matrix.cpu(), pred_col_matrix.cpu(), gt_row_matrix.cpu(), gt_col_matrix.cpu()
-            # unpack value according to util.metric TP, FP, FN, precision, recall, correct_relations, exists_relations
-            r1, r2, r3, r4, r5, r6, r7 = metric(pred_row_matrix, gt_row_matrix)
-            c1, c2, c3, c4, c5, c6, c7 = metric(pred_col_matrix, gt_col_matrix)
-            row_TP += r1
-            row_FP += r2
-            row_FN += r3
-            row_macro_precision.append(r4)
-            row_macro_recall.append(r5)
+                # compare with ground truth row matrix and column matrix
+                gt_row_matrix, gt_col_matrix = row_matrix[0, :num_vertices, :num_vertices], col_matrix[0, :num_vertices,
+                                                                                            :num_vertices]
+                # pred_row_matrix, pred_col_matrix, gt_row_matrix, gt_col_matrix = pred_row_matrix.cpu(), pred_col_matrix.cpu(), gt_row_matrix.cpu(), gt_col_matrix.cpu()
+                # unpack value according to util.metric TP, FP, FN, precision, recall, correct_relations, exists_relations
+                r1, r2, r3, r4, r5, r6, r7 = metric(pred_row_matrix, gt_row_matrix)
+                c1, c2, c3, c4, c5, c6, c7 = metric(pred_col_matrix, gt_col_matrix)
+                row_TP += r1
+                row_FP += r2
+                row_FN += r3
+                row_macro_precision.append(r4)
+                row_macro_recall.append(r5)
 
-            col_TP += c1
-            col_FP += c2
-            col_FN += c3
-            col_macro_precision.append(c4)
-            col_macro_recall.append(c5)
+                col_TP += c1
+                col_FP += c2
+                col_FN += c3
+                col_macro_precision.append(c4)
+                col_macro_recall.append(c5)
+                logger.info(f'row precision: {r4}\tcol precision: {c4}')
 
-            row_prec = torch.true_divide(torch.sum(torch.eq(gt_row_matrix, pred_row_matrix)),
-                                         (num_vertices * num_vertices)).item()
-            col_prec = torch.true_divide(torch.sum(torch.eq(gt_col_matrix, pred_col_matrix)),
-                                         (num_vertices * num_vertices)).item()
-            logger.info(f'tp: {row_TP}\tfp: {row_FP}')
-            count += 1
+                # logger.info(f'tp: {row_TP}\tfp: {row_FP}')
+                count += 1
         row_macro_precision, row_macro_recall = np.array(row_macro_precision), np.array(row_macro_recall)
         col_macro_precision, col_macro_recall = np.array(col_macro_precision), np.array(col_macro_recall)
 
@@ -317,16 +326,17 @@ if __name__ == "__main__":
                         help='Num of nearest neighbors to use')
     parser.add_argument('--model_root', type=str, default='', metavar='N',
                         help='Pretrained model root')
-    parser.add_argument('--save_step', type=int, default=150, metavar='N',
+    parser.add_argument('--save_step', type=int, default=1500, metavar='N',
                         help='Pretrained model root')
     parser.add_argument('--model_path', type=str,
-                        default='/home/lihuichao/academic/dgcnn.pytorch/checkpoints_single_batch/checkpoints_153450',
+                        default='/home/lihuichao/academic/dgcnn.pytorch/checkpoints_train_test/checkpoints_193500',
                         metavar='N',
                         help='The saved model path')
     parser.add_argument('--clear', action='store_true')
     parser.add_argument('--saved_model_dir', type=str, default='', metavar='N',
                         help='saved model dir')
     parser.add_argument('--log_level', type=str, default='DEBUG', metavar='N', help='level of log, default debug')
+    parser.add_argument('--pretrained_model', type=str, default='', metavar='N', help='the pretrained model path')
     args = parser.parse_args()
 
     _init_()

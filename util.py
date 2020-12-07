@@ -40,22 +40,22 @@ def metric(pred: torch.Tensor, gt: torch.Tensor):
     :param gt: the ground truth matrix
     :return: metric
     """
-    logger.info(f'pred matrix shape: {pred.shape}\tgt matrix shape: {gt.shape}')
+    logger.debug(f'pred matrix shape: {pred.shape}\tgt matrix shape: {gt.shape}')
     num_vertices = pred.size(0)
     # TP = torch.sum(torch.eq(pred, gt)).item()
-    logger.info(pred)
-    logger.info(gt)
-    TP = torch.sum(torch.logical_and(pred, gt)).item()
-    FP = torch.sum(pred).item() - TP
+    logger.debug(pred)
+    logger.debug(gt)
+    TP = torch.nonzero((pred-gt)==0).size(0)
+    FP = num_vertices * num_vertices - TP
     # False negative means the relation in gt is positive while in predicted is negative
-    all_ones = torch.ones([num_vertices, num_vertices], dtype=torch.int).to('cuda')
-    tmp = gt - pred - all_ones
-    FN = torch.nonzero(tmp==0).size(0)
-    correct_relations = torch.sum(torch.logical_and(pred, gt))
-    exists_relations = torch.nonzero(gt).size(0)
+    # all_ones = torch.ones([num_vertices, num_vertices], dtype=torch.int).to('cuda')
+    # tmp = gt - pred - all_ones
+    # FN = torch.nonzero(tmp==0).size(0)
+    # correct_relations = torch.sum(torch.logical_and(pred, gt))
+    # exists_relations = torch.nonzero(gt).size(0)
     precision = TP / (TP+FP)
-    recall = TP / (TP+FN)
-    return TP, FP, FN, precision, recall, correct_relations, exists_relations
+    # recall = TP / (TP+FN)
+    return TP, FP, 0, precision, 0,0,0
 
 
 class IOStream():
@@ -71,6 +71,8 @@ class IOStream():
         self.f.close()
 
 if __name__ == '__main__':
-    a = torch.ones([3,3],dtype=torch.int).to('cuda')
-    b = torch.ones([3,3],dtype=torch.int).to('cuda')
-    print(metric(a,b))
+    a = torch.ones([3,3])
+    b=torch.ones([3,3])
+    c=torch.zeros([3,3])
+    logger.info(metric(a,b))
+    logger.info(metric(a,c))
