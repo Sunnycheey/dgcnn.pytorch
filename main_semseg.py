@@ -15,6 +15,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 import sys
+import itertools
 from torch.optim.lr_scheduler import CosineAnnealingLR, StepLR
 from data import S3DIS, SciTSR
 from model import DGCNN_semseg, PairClassfier, DataParallel_wrapper
@@ -195,8 +196,10 @@ def test(args, io):
             possible_idx = torch.arange(num_vertices)
             # concatenate tensor row by column
 
-            combinations = torch.combinations(possible_idx, r=2)  # (num_vertices, num_vertices)
-            
+            # combinations = torch.combinations(possible_idx, r=2)  # (num_vertices, num_vertices)
+            # todo: 生成所有idx
+            possible_idx = range(num_vertices)
+            combinations = torch.LongTensor(list(itertools.product(possible_idx, possible_idx)))
             row_features1, row_features2 = out[:, :, combinations[:, 0]], out[:, :, combinations[:,
                                                                                     1]]  # (batch_size, 256, combination(num_vertices,2))
             col_features1, col_features2 = out[:, :, combinations[:, 0]], out[:, :, combinations[:,
@@ -317,7 +320,7 @@ if __name__ == "__main__":
     parser.add_argument('--save_step', type=int, default=150, metavar='N',
                         help='Pretrained model root')
     parser.add_argument('--model_path', type=str,
-                        default='/home/lihuichao/academic/dgcnn.pytorch/checkpoints_train_test/checkpoints_25650',
+                        default='/home/lihuichao/academic/dgcnn.pytorch/checkpoints_single_batch/checkpoints_153450',
                         metavar='N',
                         help='The saved model path')
     parser.add_argument('--clear', action='store_true')
