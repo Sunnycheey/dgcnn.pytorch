@@ -26,13 +26,14 @@ import sklearn.metrics as metrics
 import shutil
 from loguru import logger
 from tqdm import tqdm
-from collections import OrderedDict
 
 logger.remove()
-logger.add('single_batch_run.log')
+logger.add('knn_dis.log')
 
 
 def _init_():
+    # todo: 模型迁移至cpu
+    # todo: 训练完一段时间之后进行验证
     if not os.path.exists('checkpoints'):
         os.makedirs('checkpoints')
     if not os.path.exists('checkpoints/' + args.exp_name):
@@ -65,10 +66,10 @@ def train(args, io):
     padding = True
     if args.batch_size == 1:
         padding = False
-    train_loader = DataLoader(SciTSR(partition='train', dataset_dir='/home/lihuichao/academic/SciTSR/dataset'),
+    train_loader = DataLoader(SciTSR(partition=args.train_partition, dataset_dir='/home/lihuichao/academic/SciTSR/dataset', normalize=True),
                               num_workers=8, batch_size=args.batch_size, shuffle=True, drop_last=True)
-    test_loader = DataLoader(SciTSR(partition='test', dataset_dir='/home/lihuichao/academic/SciTSR/dataset'),
-                             num_workers=8, batch_size=args.test_batch_size, shuffle=True, drop_last=False)
+    # test_loader = DataLoader(SciTSR(partition='test', dataset_dir='/home/lihuichao/academic/SciTSR/dataset', normalize=True),
+    #                          num_workers=8, batch_size=args.test_batch_size, shuffle=True, drop_last=False)
 
     device = torch.device("cuda" if args.cuda else "cpu")
 
@@ -81,12 +82,18 @@ def train(args, io):
     if args.clear:
         shutil.rmtree(args.saved_model_dir)
         os.makedirs(args.saved_model_dir)
+    writer = None
+    if args.summary:
+        # os.makedirs(args.summary)
+        from torch.utils.tensorboard import SummaryWriter
+        writer = SummaryWriter(args.summary)
 
     row_classifier, col_classifier = PairClassfier(512), PairClassfier(512)
     # row_classifier, col_classifier = nn.DataParallel(row_classifier), nn.DataParallel(col_classifier)
-
     # model = nn.DataParallel(model)
-
+    model.train()
+    row_classifier.train()
+    col_classifier.train()
     print("Let's use", torch.cuda.device_count(), "GPUs!")
     params = list(model.parameters()) + list(row_classifier.parameters()) + list(col_classifier.parameters())
 
@@ -115,9 +122,11 @@ def train(args, io):
         logger.info(f'load successfully!')
 
     # best_test_iou = 0
+
     data_paraller = DataParallel_wrapper(model, row_classifier, col_classifier)
     data_paraller.to(device)
     data_paraller = nn.DataParallel(data_paraller)
+    inner_count = 0
     for epoch in tqdm(range(args.epochs)):
         ####################
         # Train
@@ -129,17 +138,22 @@ def train(args, io):
         # row_classifier.train()
         # col_classifier.train()
         for data in tqdm(train_loader):
+            if iterate_step != 0 and inner_count <= iterate_step:
+                inner_count += 1
+                continue
             iterate_step += 1
             file, features, row_matrix, col_matrix, num_vertices = data['file_path'], data['features'].type(torch.FloatTensor), data[
                 'row_matrix'], data['col_matrix'], data['num_vertices']
-            logger.debug(f'input feature shape: {features.shape}')
-            logger.debug(f'input feature: {features}')
+            # logger.debug(f'input row matrix: {row_matrix}\ninput col matrix: {col_matrix}')
+            logger.debug(f'input features: {features}')
             batch_size = features.size()[0]
             opt.zero_grad()
             loss = data_paraller(features, row_matrix, col_matrix, num_vertices)
             loss = loss.sum()
 
-            logger.info(f'loss value: {loss.item()}')
+            if writer:
+                writer.add_scalar('Loss/2_1_with_normalization_correct', loss.item(), iterate_step)
+                logger.info(f'loss value: {loss.item()}')
             loss.backward()
             opt.step()
             # pred = seg_pred.max(dim=2)[1]  # (batch_size, num_points)
@@ -150,9 +164,11 @@ def train(args, io):
                 torch.save({'dgcnn': model.state_dict(), 'row_classifier': row_classifier.state_dict(),
                             'col_classifier': col_classifier.state_dict()},
                            f'{args.saved_model_dir}/checkpoints_{iterate_step}')
+                writer.flush()
         torch.save({'dgcnn': model.state_dict(), 'row_classifier': row_classifier.state_dict(),
                     'col_classifier': col_classifier.state_dict()},
                    f'{args.saved_model_dir}/checkpoints_{iterate_step}')
+        writer.flush()
         outstr = 'Train %d, loss: %.6f ' % (epoch, train_loss * 1.0 / count)
         io.cprint(outstr)
 
@@ -163,7 +179,7 @@ def test(args, io):
     all_true_seg = []
     all_pred_seg = []
 
-    test_loader = DataLoader(SciTSR(partition='test', dataset_dir='/home/lihuichao/academic/SciTSR/dataset'),
+    test_loader = DataLoader(SciTSR(partition='test', dataset_dir='/home/lihuichao/academic/SciTSR/dataset', normalize=True),
                              num_workers=8, batch_size=args.test_batch_size, shuffle=True, drop_last=False)
     with torch.no_grad():
         device = torch.device("cuda" if args.cuda else "cpu")
@@ -186,8 +202,9 @@ def test(args, io):
         dgcnn, row_classifier, col_classifier = dgcnn.to(device), row_classifier.to(device), col_classifier.to(device)
         dgcnn, row_classifier, col_classifier = dgcnn.eval(), row_classifier.eval(), col_classifier.eval()
         count = 0
-        row_TP, row_FP, row_FN, col_TP, col_FP, col_FN = 0, 0, 0, 0, 0, 0
-        row_macro_precision, row_macro_recall, col_macro_precision, col_macro_recall = [], [], [], []
+        row_TP, row_FP, b_row_TP, b_row_FP, b_row_FN, col_TP, col_FP, b_col_TP, b_col_FP, b_col_FN = 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+        row_macro_precision, col_macro_precision = [], []
+        b_row_macro_precision, b_row_macro_recall, b_col_macro_precision, b_col_macro_recall = [], [], [], []
         for data in tqdm(test_loader):
             with logger.catch():
                 features, row_matrix, col_matrix, num_vertices = data['features'].type(torch.FloatTensor), data[
@@ -251,35 +268,41 @@ def test(args, io):
                 gt_row_matrix, gt_col_matrix = row_matrix[0, :num_vertices, :num_vertices], col_matrix[0, :num_vertices,
                                                                                             :num_vertices]
                 # pred_row_matrix, pred_col_matrix, gt_row_matrix, gt_col_matrix = pred_row_matrix.cpu(), pred_col_matrix.cpu(), gt_row_matrix.cpu(), gt_col_matrix.cpu()
-                # unpack value according to util.metric TP, FP, FN, precision, recall, correct_relations, exists_relations
-                r1, r2, r3, r4, r5, r6, r7 = metric(pred_row_matrix, gt_row_matrix)
-                c1, c2, c3, c4, c5, c6, c7 = metric(pred_col_matrix, gt_col_matrix)
+                # unpack value according to util.metric TP, FP, precision, btp, bfp, bfn, bprecision, brecall
+                r1, r2, r3, r4, r5, r6, r7, r8 = metric(pred_row_matrix, gt_row_matrix)
+                c1, c2, c3, c4, c5, c6, c7, c8 = metric(pred_col_matrix, gt_col_matrix)
                 row_TP += r1
                 row_FP += r2
-                row_FN += r3
-                row_macro_precision.append(r4)
-                row_macro_recall.append(r5)
+                b_row_TP += r4
+                b_row_FP += r5
+                b_row_FN += r6
+                row_macro_precision.append(r3)
+                b_row_macro_precision.append(r7)
+                b_row_macro_recall.append(r8)
 
                 col_TP += c1
                 col_FP += c2
-                col_FN += c3
-                col_macro_precision.append(c4)
-                col_macro_recall.append(c5)
-                logger.info(f'row precision: {r4}\tcol precision: {c4}')
+                b_col_TP += c4
+                b_col_FP += c5
+                b_col_FN += c6
+                col_macro_precision.append(c3)
+                b_col_macro_precision.append(c7)
+                b_col_macro_recall.append(c8)
+                logger.info(f'row precision: {r3}\tcol precision: {c3}')
 
                 # logger.info(f'tp: {row_TP}\tfp: {row_FP}')
                 count += 1
-        row_macro_precision, row_macro_recall = np.array(row_macro_precision), np.array(row_macro_recall)
-        col_macro_precision, col_macro_recall = np.array(col_macro_precision), np.array(col_macro_recall)
+        row_macro_precision, b_row_macro_precision, b_row_macro_recall = np.array(row_macro_precision), np.array(b_row_macro_precision), np.array(b_row_macro_recall)
+        col_macro_precision, b_col_macro_precision, b_col_macro_recall = np.array(col_macro_precision), np.array(b_col_macro_precision), np.array(b_col_macro_recall)
 
         logger.success(
-            f'[row]: macro precision: {np.average(row_macro_precision)}\tmacro recall: {np.average(row_macro_recall)}')
+            f'[row]: macro precision: {np.average(row_macro_precision)}\tbinary macro precision: {np.average(b_row_macro_precision)}\tbinary macro recall: {np.average(b_row_macro_recall)}')
         logger.success(
-            f'[row]: micro precision: {row_TP / (row_TP + row_FP)}\tmicro recall: {row_TP / (row_TP + row_FN)}')
+            f'[row]: micro precision: {row_TP / (row_TP + row_FP)}\tbinary macro recall: {b_row_TP / (b_row_TP + b_row_FP)}\tbinary micro recall: {b_row_TP / (b_row_TP + b_row_FN)}')
         logger.success(
-            f'[col]: macro precision: {np.average(col_macro_precision)}\tmacro recall: {np.average(col_macro_recall)}')
+            f'[col]: macro precision: {np.average(col_macro_precision)}\tbinary macro precision: {np.average(b_col_macro_precision)}\tmacro recall: {np.average(b_col_macro_recall)}')
         logger.success(
-            f'[col]: micro precision: {col_TP / (col_TP + col_FP)}\tmicro recall: {col_TP / (col_TP + col_FN)}')
+            f'[col]: micro precision: {col_TP / (col_TP + col_FP)}\tmicro precision: {b_col_TP / (b_col_TP + b_col_FP)}\tmicro recall: {b_col_TP / (b_col_TP + b_col_FN)}')
         # logger.success(f'average row precision: {row_prec}\taverage columm precision: {col_prec}')
 
 
@@ -326,10 +349,10 @@ if __name__ == "__main__":
                         help='Num of nearest neighbors to use')
     parser.add_argument('--model_root', type=str, default='', metavar='N',
                         help='Pretrained model root')
-    parser.add_argument('--save_step', type=int, default=1500, metavar='N',
+    parser.add_argument('--save_step', type=int, default=3000, metavar='N',
                         help='Pretrained model root')
     parser.add_argument('--model_path', type=str,
-                        default='/home/lihuichao/academic/dgcnn.pytorch/checkpoints_train_test/checkpoints_193500',
+                        default='/home/lihuichao/academic/dgcnn.pytorch/checkpoints_knn_balanced_normalized/checkpoints_82965',
                         metavar='N',
                         help='The saved model path')
     parser.add_argument('--clear', action='store_true')
@@ -337,6 +360,8 @@ if __name__ == "__main__":
                         help='saved model dir')
     parser.add_argument('--log_level', type=str, default='DEBUG', metavar='N', help='level of log, default debug')
     parser.add_argument('--pretrained_model', type=str, default='', metavar='N', help='the pretrained model path')
+    parser.add_argument('--summary',type=str, default='', metavar='N', help='tensor board summary directory')
+    parser.add_argument('--train_partition',type=str,default='train', metavar='N', help='partition of dataset')
     args = parser.parse_args()
 
     _init_()

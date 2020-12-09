@@ -19,6 +19,8 @@ import h5py
 import numpy as np
 import torch
 from torch.utils.data import Dataset
+from tqdm import tqdm
+from loguru import logger
 
 
 def download_modelnet40():
@@ -182,7 +184,7 @@ def rotate_pointcloud(pointcloud):
     return pointcloud
 
 
-def load_scitsr_data(dataset_dir, partition, padding=False, max_vertice_num=512, feature_size=15):
+def load_scitsr_data(dataset_dir, partition, padding=False, max_vertice_num=512):
     """
     load scitsr dataset
     :param dataset_dir: dataset dir path
@@ -200,7 +202,8 @@ def load_scitsr_data(dataset_dir, partition, padding=False, max_vertice_num=512,
     main_folder = os.path.join(dataset_dir, partition)
     chunk_dir = os.path.join(main_folder, CHUNK)
     rel_dir = os.path.join(main_folder, REL)
-    for chunk_file_path in os.listdir(chunk_dir):
+    logger.info(f'Start loading data...')
+    for chunk_file_path in tqdm(os.listdir(chunk_dir)):
         if chunk_file_path.endswith('.ipynb_checkpoints'):
             continue
         chunk_id = chunk_file_path.split('.')[0:-1]
@@ -278,14 +281,20 @@ class ModelNet40(Dataset):
 
 
 class SciTSR(Dataset):
-    def __init__(self, dataset_dir, max_vertice_num=1024, feature_size=15, partition='train'):
+    def __init__(self, dataset_dir, max_vertice_num=1024, feature_size=15, partition='train', normalize=False, mean=None, std=None):
         self.data = load_scitsr_data(dataset_dir, partition,
                                      max_vertice_num=max_vertice_num)  # data: [num_points * feature_size], row/col_matix: [num_points, num_points]
         self.feature_size = feature_size
         self.max_vertice_num = max_vertice_num
         self.partition = partition
+        self.normalize = normalize
+        if normalize:
+            self.mean = torch.tensor([316.78361649456815, 346.4171709500245, 456.7999285136674, 461.4904624557267, 331.60039372229636, 459.145195484697, 1.0708147421800533, 1.172230501966359, 4.613889995626876, 4.661217907288215, 1.1215226220731356, 4.637553951457586, 4.690533942059325, 29.633554455456355])
+            self.std = torch.tensor([111.50166485622228, 109.23567514593609, 87.45144478458685, 87.45525629652187, 109.27551704485022, 87.45231689518513, 0.48120236318145115, 0.4996407959940434, 4.125667755990256, 4.164269755774229, 0.48757244649731324, 4.144962765395593, 0.8503987020471627, 31.073357274697436])
 
     def __getitem__(self, i):
+        if self.normalize:
+            self.data[i]['features'].sub_(self.mean).div_(self.std)
         return self.data[i]
 
     def __len__(self):
@@ -415,6 +424,17 @@ if __name__ == '__main__':
     # print(data.shape)
     # print(seg.shape)
 
-    scitsr = SciTSR(dataset_dir='/home/lihuichao/academic/SciTSR/dataset')
-    data, row_matrix, col_matrix = scitsr[0]
-    print(data.shape, row_matrix, col_matrix)
+    # records = load_scitsr_data('/home/lihuichao/academic/SciTSR/dataset', 'train')
+    # feature = None
+    # for i, record in enumerate(records):
+    #     if feature is None:
+    #         feature = record['features']
+    #     else:
+    #         feature = torch.cat((feature, record['features']), dim=0)
+    # mean, std = torch.mean(feature, dim=0), torch.std(feature, dim=0)
+    # std += 1e-6
+    # print(mean.tolist())
+    # print(std.tolist())
+    # feature.sub_(mean).div_(std)
+    # logger.info(feature)
+    pass
