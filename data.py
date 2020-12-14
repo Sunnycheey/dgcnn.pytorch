@@ -18,9 +18,74 @@ import glob
 import h5py
 import numpy as np
 import torch
+import networkx as nx
+import itertools
 from torch.utils.data import Dataset
 from tqdm import tqdm
 from loguru import logger
+
+
+def get_all_paths_from_graph(G: nx.DiGraph):
+    ret = []
+    for source in G.nodes():
+        for target in G.nodes():
+            if source != target and G.in_degree(source) == 0 and G.out_degree(target) == 0:
+                try:
+                    paths = nx.all_simple_paths(G, source, target)
+                    paths = list(paths)
+                    if len(paths) >= 2:
+                        logger.warning(f'exists {len(paths)} path between source and target')
+                    if len(paths) >= 10000:
+                        logger.warning(f'too many path: {len(paths)}')
+                        return []
+                    ret.extend(list(paths))
+                except nx.NetworkXNoPath as e:
+                    pass
+    return ret
+
+
+def pre_process(rel_dir: str, output_dir: str):
+    """
+    preprocess the SciTSR dataset
+    :param rel_dir relation directory
+    :param output_dir the result dir
+    :return: None
+    """
+
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+    for file_path in tqdm(os.listdir(rel_dir)):
+        full_path = os.path.join(rel_dir, file_path)
+        logger.info(f'file path: {full_path}')
+        row_G = nx.DiGraph()
+        col_G = nx.DiGraph()
+        lines = []
+        row_rels, col_rels = [], []
+        with open(full_path, 'r') as f:
+            for line in f:
+                start, end, rel_type = line.split('\t')
+                rel_type = rel_type.split(':')[0]
+                start, end = int(start), int(end)
+                if rel_type == '1':
+                    row_G.add_node(start)
+                    row_G.add_node(end)
+                    row_G.add_edge(start, end)
+                elif rel_type == '2':
+                    col_G.add_node(start)
+                    col_G.add_node(end)
+                    col_G.add_edge(start, end)
+            # if not graph_assert(row_G): logger.info(file_path)
+            # if not graph_assert(col_G): logger.info(file_path)
+        for row_points_set in get_all_paths_from_graph(row_G):
+            row_pairs = itertools.permutations(row_points_set, 2)
+            for (v1, v2) in row_pairs:
+                lines.append(f'{v1}\t{v2}\t1:0')
+        for col_points_set in get_all_paths_from_graph(col_G):
+            col_pairs = itertools.permutations(col_points_set, 2)
+            for (v1, v2) in col_pairs:
+                lines.append(f'{v1}\t{v2}\t2:0')
+        with open(f'{output_dir}/{file_path}', 'w') as f:
+            f.write('\n'.join([line for line in lines]))
 
 
 def download_modelnet40():
@@ -245,17 +310,21 @@ def load_scitsr_data(dataset_dir, partition, padding=False, max_vertice_num=512)
         tab_w, tab_h = coords[:, 1].max() - coords[:, 0].min(), coords[:, 3].max() - coords[:, 2].min()
         x_center, y_center = (coords[:, 0] + coords[:, 1]) / 2, (coords[:, 2] + coords[:, 3]) / 2
         relative_x1, relative_x2, relative_y1, relative_y2 = coords[:, 0] / tab_w, coords[:, 1] / tab_w, coords[
-                                                                                                         :,2] / tab_h, coords[
-                                                                                                                      :,3] / tab_h
+                                                                                                         :,
+                                                                                                         2] / tab_h, coords[
+                                                                                                                     :,
+                                                                                                                     3] / tab_h
         relative_x_center, relative_y_center = (coords[:, 0] + coords[:, 1]) / 2 / tab_w, (
-                    coords[:, 2] + coords[:, 3]) / 2 / tab_h
+                coords[:, 2] + coords[:, 3]) / 2 / tab_h
         height_of_chunk, width_of_chunk = coords[:, 3] - coords[:, 2], coords[:, 1] - coords[:, 0]
         # tab_w_list, tab_h_list = np.zeros([])
         x_center, y_center, relative_x1, relative_x2, relative_y1, relative_y2, relative_x_center, relative_y_center, height_of_chunk, width_of_chunk = \
-            x_center.unsqueeze(1), y_center.unsqueeze(1), relative_x1.unsqueeze(1), relative_x2.unsqueeze(1), relative_y1.unsqueeze(1), relative_y2.unsqueeze(1), relative_x_center.unsqueeze(1), relative_y_center.unsqueeze(1), height_of_chunk.unsqueeze(1), width_of_chunk.unsqueeze(1)
+            x_center.unsqueeze(1), y_center.unsqueeze(1), relative_x1.unsqueeze(1), relative_x2.unsqueeze(
+                1), relative_y1.unsqueeze(1), relative_y2.unsqueeze(1), relative_x_center.unsqueeze(
+                1), relative_y_center.unsqueeze(1), height_of_chunk.unsqueeze(1), width_of_chunk.unsqueeze(1)
         feature = torch.cat((coords, x_center, y_center, relative_x1, relative_x2, relative_y1,
-                                  relative_y2, relative_x_center, relative_y_center, height_of_chunk, width_of_chunk),
-                                 dim=1)
+                             relative_y2, relative_x_center, relative_y_center, height_of_chunk, width_of_chunk),
+                            dim=1)
         data.append({'file_path': chunk_file_path, 'features': feature, 'row_matrix': row_matrix,
                      'col_matrix': col_matrix, 'num_vertices': num_points})
 
@@ -281,7 +350,8 @@ class ModelNet40(Dataset):
 
 
 class SciTSR(Dataset):
-    def __init__(self, dataset_dir, max_vertice_num=1024, feature_size=15, partition='train', normalize=False, mean=None, std=None):
+    def __init__(self, dataset_dir, max_vertice_num=1024, feature_size=15, partition='train', normalize=False,
+                 mean=None, std=None):
         self.data = load_scitsr_data(dataset_dir, partition,
                                      max_vertice_num=max_vertice_num)  # data: [num_points * feature_size], row/col_matix: [num_points, num_points]
         self.feature_size = feature_size
@@ -289,8 +359,14 @@ class SciTSR(Dataset):
         self.partition = partition
         self.normalize = normalize
         if normalize:
-            self.mean = torch.tensor([316.78361649456815, 346.4171709500245, 456.7999285136674, 461.4904624557267, 331.60039372229636, 459.145195484697, 1.0708147421800533, 1.172230501966359, 4.613889995626876, 4.661217907288215, 1.1215226220731356, 4.637553951457586, 4.690533942059325, 29.633554455456355])
-            self.std = torch.tensor([111.50166485622228, 109.23567514593609, 87.45144478458685, 87.45525629652187, 109.27551704485022, 87.45231689518513, 0.48120236318145115, 0.4996407959940434, 4.125667755990256, 4.164269755774229, 0.48757244649731324, 4.144962765395593, 0.8503987020471627, 31.073357274697436])
+            self.mean = torch.tensor(
+                [316.78361649456815, 346.4171709500245, 456.7999285136674, 461.4904624557267, 331.60039372229636,
+                 459.145195484697, 1.0708147421800533, 1.172230501966359, 4.613889995626876, 4.661217907288215,
+                 1.1215226220731356, 4.637553951457586, 4.690533942059325, 29.633554455456355])
+            self.std = torch.tensor(
+                [111.50166485622228, 109.23567514593609, 87.45144478458685, 87.45525629652187, 109.27551704485022,
+                 87.45231689518513, 0.48120236318145115, 0.4996407959940434, 4.125667755990256, 4.164269755774229,
+                 0.48757244649731324, 4.144962765395593, 0.8503987020471627, 31.073357274697436])
 
     def __getitem__(self, i):
         if self.normalize:
@@ -437,4 +513,5 @@ if __name__ == '__main__':
     # print(std.tolist())
     # feature.sub_(mean).div_(std)
     # logger.info(feature)
-    pass
+    pre_process('/home/lihuichao/academic/SciTSR/dataset/train/rel_original',
+                '/home/lihuichao/academic/SciTSR/dataset/train/rel_new_new')

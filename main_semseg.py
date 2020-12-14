@@ -21,14 +21,14 @@ from data import S3DIS, SciTSR
 from model import DGCNN_semseg, PairClassfier, DataParallel_wrapper
 import numpy as np
 from torch.utils.data import DataLoader
-from util import cal_loss, IOStream, metric
+from util import cal_loss, IOStream, metric, error_correction, draw_figure, draw_rectangle
 import sklearn.metrics as metrics
 import shutil
+import json
+import matplotlib.pyplot as plt
 from loguru import logger
 from tqdm import tqdm
 
-logger.remove()
-logger.add('knn_dis.log')
 
 
 def _init_():
@@ -46,9 +46,10 @@ def _init_():
     os.system('cp model.py checkpoints' + '/' + args.exp_name + '/' + 'model.py.backup')
     os.system('cp util.py checkpoints' + '/' + args.exp_name + '/' + 'util.py.backup')
     os.system('cp data.py checkpoints' + '/' + args.exp_name + '/' + 'data.py.backup')
+    logger.remove()
     logger.add(sys.stdout, level=args.log_level)
-    logger.add('single_batch_run.log')
-
+    if args.log:
+        logger.add(args.log)
 
 def calculate_sem_IoU(pred_np, seg_np):
     I_all = np.zeros(13)
@@ -127,57 +128,60 @@ def train(args, io):
     data_paraller.to(device)
     data_paraller = nn.DataParallel(data_paraller)
     inner_count = 0
+    data_paraller.train()
     for epoch in tqdm(range(args.epochs)):
         ####################
         # Train
         ####################
         train_loss = 0.0
         count = 0.0
-        data_paraller.train()
         # model.train()
         # row_classifier.train()
         # col_classifier.train()
         for data in tqdm(train_loader):
-            if iterate_step != 0 and inner_count <= iterate_step:
-                inner_count += 1
-                continue
-            iterate_step += 1
-            file, features, row_matrix, col_matrix, num_vertices = data['file_path'], data['features'].type(torch.FloatTensor), data[
-                'row_matrix'], data['col_matrix'], data['num_vertices']
-            # logger.debug(f'input row matrix: {row_matrix}\ninput col matrix: {col_matrix}')
-            logger.debug(f'input features: {features}')
-            batch_size = features.size()[0]
-            opt.zero_grad()
-            loss = data_paraller(features, row_matrix, col_matrix, num_vertices)
-            loss = loss.sum()
+            with logger.catch():
+                if iterate_step != 0 and inner_count <= iterate_step:
+                    inner_count += 1
+                    continue
+                iterate_step += 1
+                file, features, row_matrix, col_matrix, num_vertices = data['file_path'], data['features'].type(torch.FloatTensor), data[
+                    'row_matrix'], data['col_matrix'], data['num_vertices']
+                # logger.debug(f'input row matrix: {row_matrix}\ninput col matrix: {col_matrix}')
+                logger.debug(f'input features: {features}')
+                batch_size = features.size()[0]
+                opt.zero_grad()
+                loss = data_paraller(features, row_matrix, col_matrix, num_vertices)
+                loss = loss.sum()
 
-            if writer:
-                writer.add_scalar('Loss/2_1_with_normalization_correct', loss.item(), iterate_step)
-                logger.info(f'loss value: {loss.item()}')
-            loss.backward()
-            opt.step()
-            # pred = seg_pred.max(dim=2)[1]  # (batch_size, num_points)
-            count += batch_size
-            train_loss += loss.item() * batch_size
-            torch.cuda.empty_cache()
-            if iterate_step % args.save_step == 0:
-                torch.save({'dgcnn': model.state_dict(), 'row_classifier': row_classifier.state_dict(),
-                            'col_classifier': col_classifier.state_dict()},
-                           f'{args.saved_model_dir}/checkpoints_{iterate_step}')
-                writer.flush()
+                if writer:
+                    writer.add_scalar('Loss/expand_rel', loss.item(), iterate_step)
+                    logger.info(f'loss value: {loss.item()}')
+                loss.backward()
+                opt.step()
+                # pred = seg_pred.max(dim=2)[1]  # (batch_size, num_points)
+                count += batch_size
+                train_loss += loss.item() * batch_size
+                torch.cuda.empty_cache()
+                if iterate_step % args.save_step == 0:
+                    torch.save({'dgcnn': model.state_dict(), 'row_classifier': row_classifier.state_dict(),
+                                'col_classifier': col_classifier.state_dict()},
+                               f'{args.saved_model_dir}/checkpoints_{iterate_step}')
+                    if writer:
+                        writer.flush()
         torch.save({'dgcnn': model.state_dict(), 'row_classifier': row_classifier.state_dict(),
                     'col_classifier': col_classifier.state_dict()},
                    f'{args.saved_model_dir}/checkpoints_{iterate_step}')
-        writer.flush()
+        if writer:
+            writer.flush()
         outstr = 'Train %d, loss: %.6f ' % (epoch, train_loss * 1.0 / count)
         io.cprint(outstr)
 
 
 def test(args, io):
-    all_true_cls = []
-    all_pred_cls = []
-    all_true_seg = []
-    all_pred_seg = []
+
+    if args.summary:
+        from torch.utils.tensorboard import SummaryWriter
+        writer = SummaryWriter(args.summary)
 
     test_loader = DataLoader(SciTSR(partition='test', dataset_dir='/home/lihuichao/academic/SciTSR/dataset', normalize=True),
                              num_workers=8, batch_size=args.test_batch_size, shuffle=True, drop_last=False)
@@ -205,22 +209,24 @@ def test(args, io):
         row_TP, row_FP, b_row_TP, b_row_FP, b_row_FN, col_TP, col_FP, b_col_TP, b_col_FP, b_col_FN = 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
         row_macro_precision, col_macro_precision = [], []
         b_row_macro_precision, b_row_macro_recall, b_col_macro_precision, b_col_macro_recall = [], [], [], []
+        num_vertices_list = []
         for data in tqdm(test_loader):
             with logger.catch():
-                features, row_matrix, col_matrix, num_vertices = data['features'].type(torch.FloatTensor), data[
+                file_path, features, row_matrix, col_matrix, num_vertices = data['file_path'], data['features'].type(torch.FloatTensor), data[
                     'row_matrix'], data['col_matrix'], data['num_vertices']
                 data, row_matrix, col_matrix, num_vertices = features.to(device), row_matrix.to(device), col_matrix.to(
                     device), num_vertices.to(device)
+                logger.info(f'file path: {file_path}')
                 logger.debug(
                     f'num_vertices value: {num_vertices[0].item()}\tdata shape: {data.shape}\trow matrix shape: {row_matrix.shape}\tcol matrix shape: {col_matrix.shape}')
-                logger.debug(f'input features: {data}')
+                # logger.debug(f'input features: {data}')
                 num_vertices = num_vertices[0]
                 # data = data.permute(0,2,1)
                 batch_size = data.size(0)
                 out = dgcnn(data)  # (batch_size, 256, num_points)
                 out = out[:, :, :num_vertices]  # (batch_size, 256, num_vertices)
-                logger.debug(f'output shape: {out.shape}')
-                logger.debug(f'output: {out}')
+                # logger.debug(f'output shape: {out.shape}')
+                # logger.debug(f'output: {out}')
                 pred_row_matrix = torch.zeros([num_vertices, num_vertices], dtype=torch.int).to(device)
                 pred_col_matrix = torch.zeros([num_vertices, num_vertices], dtype=torch.int).to(device)
                 possible_idx = torch.arange(num_vertices)
@@ -245,8 +251,8 @@ def test(args, io):
                                                                                      1)  # (batch_size, combination(num_vertices,2), 512)
                 row_output, col_output = row_classifier(row_pairs), col_classifier(
                     col_pairs)  # (batch_size, combination(num_vertices, 2), 2)
-                logger.debug(f'row output shape: {row_output.shape}')
-                logger.debug(f'row output: {row_output}')
+                # logger.debug(f'row output shape: {row_output.shape}')
+                # logger.debug(f'row output: {row_output}')
                 # row_output, col_output = row_output.permute(0, 2, 1), col_output.permute(0, 2, 1) # (batch_size, combination(num_vertices,2), 2)
 
                 row_idx, col_idx = torch.argmax(row_output, 2), torch.argmax(col_output,
@@ -264,11 +270,23 @@ def test(args, io):
                 pred_row_matrix[r_row_idx, c_row_idx] = 1
                 pred_col_matrix[r_col_idx, c_col_idx] = 1
 
+                pred_row_matrix = error_correction(pred_row_matrix, row_output)
+                pred_col_matrix = error_correction(pred_col_matrix, col_output)
                 # compare with ground truth row matrix and column matrix
                 gt_row_matrix, gt_col_matrix = row_matrix[0, :num_vertices, :num_vertices], col_matrix[0, :num_vertices,
                                                                                             :num_vertices]
+                if args.saved_predicted_dir:
+                    chunk_path = '/home/lihuichao/academic/SciTSR/dataset/test/chunk/' + file_path[0]
+                    with open(chunk_path, 'r') as f:
+                        obj = json.load(f)
+                    chunks = obj['chunks']
+                    row_fig = draw_rectangle(pred_row_matrix, gt_row_matrix, chunks)
+                    col_fig = draw_rectangle(pred_col_matrix, gt_col_matrix, chunks)
+                    row_fig.savefig(f'{args.saved_predicted_dir}/{file_path[0]}_row.png')
+                    col_fig.savefig(f'{args.saved_predicted_dir}/{file_path[0]}_col.png')
                 # pred_row_matrix, pred_col_matrix, gt_row_matrix, gt_col_matrix = pred_row_matrix.cpu(), pred_col_matrix.cpu(), gt_row_matrix.cpu(), gt_col_matrix.cpu()
                 # unpack value according to util.metric TP, FP, precision, btp, bfp, bfn, bprecision, brecall
+                num_vertices_list.append(num_vertices.item())
                 r1, r2, r3, r4, r5, r6, r7, r8 = metric(pred_row_matrix, gt_row_matrix)
                 c1, c2, c3, c4, c5, c6, c7, c8 = metric(pred_col_matrix, gt_col_matrix)
                 row_TP += r1
@@ -288,22 +306,33 @@ def test(args, io):
                 col_macro_precision.append(c3)
                 b_col_macro_precision.append(c7)
                 b_col_macro_recall.append(c8)
-                logger.info(f'row precision: {r3}\tcol precision: {c3}')
+                logger.info(f'row precision: {r3}\t[b] precision: {r7}\t[b] recall: {r8}')
+                logger.info(f'col precision: {c3}\t[b] precision: {c7}\t[b] recall: {c8}')
+                # if writer:
+                #     writer.add_scalar('Eval/[rb]precision_#vertices', r7, num_vertices)
+                #     writer.add_scalar('Eval/[rb]recall_#vertices', r8, num_vertices)
+                #     writer.add_scalar('Eval/[cb]precision_#vertices', c7, num_vertices)
+                #     writer.add_scalar('Eval/[cb]recall_#vertices', c8, num_vertices)
 
                 # logger.info(f'tp: {row_TP}\tfp: {row_FP}')
                 count += 1
         row_macro_precision, b_row_macro_precision, b_row_macro_recall = np.array(row_macro_precision), np.array(b_row_macro_precision), np.array(b_row_macro_recall)
         col_macro_precision, b_col_macro_precision, b_col_macro_recall = np.array(col_macro_precision), np.array(b_col_macro_precision), np.array(b_col_macro_recall)
+        num_vertices_list = np.array(num_vertices_list)
 
         logger.success(
             f'[row]: macro precision: {np.average(row_macro_precision)}\tbinary macro precision: {np.average(b_row_macro_precision)}\tbinary macro recall: {np.average(b_row_macro_recall)}')
         logger.success(
-            f'[row]: micro precision: {row_TP / (row_TP + row_FP)}\tbinary macro recall: {b_row_TP / (b_row_TP + b_row_FP)}\tbinary micro recall: {b_row_TP / (b_row_TP + b_row_FN)}')
+            f'[row]: micro precision: {row_TP / (row_TP + row_FP)}\tbinary micro precision: {b_row_TP / (b_row_TP + b_row_FP)}\tbinary micro recall: {b_row_TP / (b_row_TP + b_row_FN)}')
         logger.success(
             f'[col]: macro precision: {np.average(col_macro_precision)}\tbinary macro precision: {np.average(b_col_macro_precision)}\tmacro recall: {np.average(b_col_macro_recall)}')
         logger.success(
-            f'[col]: micro precision: {col_TP / (col_TP + col_FP)}\tmicro precision: {b_col_TP / (b_col_TP + b_col_FP)}\tmicro recall: {b_col_TP / (b_col_TP + b_col_FN)}')
+            f'[col]: micro precision: {col_TP / (col_TP + col_FP)}\tbinary micro precision: {b_col_TP / (b_col_TP + b_col_FP)}\tmicro recall: {b_col_TP / (b_col_TP + b_col_FN)}')
         # logger.success(f'average row precision: {row_prec}\taverage columm precision: {col_prec}')
+        figure = draw_figure(num_vertices_list, b_row_macro_precision, b_row_macro_recall, b_col_macro_precision,
+                             b_col_macro_recall)
+        figure.savefig('result_final')
+        logger.info('figure saved!')
 
 
 if __name__ == "__main__":
@@ -345,7 +374,7 @@ if __name__ == "__main__":
                         help='dropout rate')
     parser.add_argument('--emb_dims', type=int, default=1024, metavar='N',
                         help='Dimension of embeddings')
-    parser.add_argument('--k', type=int, default=30, metavar='N',
+    parser.add_argument('--k', type=int, default=40, metavar='N',
                         help='Num of nearest neighbors to use')
     parser.add_argument('--model_root', type=str, default='', metavar='N',
                         help='Pretrained model root')
@@ -362,6 +391,8 @@ if __name__ == "__main__":
     parser.add_argument('--pretrained_model', type=str, default='', metavar='N', help='the pretrained model path')
     parser.add_argument('--summary',type=str, default='', metavar='N', help='tensor board summary directory')
     parser.add_argument('--train_partition',type=str,default='train', metavar='N', help='partition of dataset')
+    parser.add_argument('--log', type=str, default='', metavar='N', help='logger file name')
+    parser.add_argument('--saved_predicted_dir', type=str, default='', metavar='N', help='dir path of predicted result')
     args = parser.parse_args()
 
     _init_()
