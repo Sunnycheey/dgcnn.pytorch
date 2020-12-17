@@ -67,7 +67,7 @@ def train(args, io):
     padding = True
     if args.batch_size == 1:
         padding = False
-    train_loader = DataLoader(SciTSR(partition=args.train_partition, dataset_dir='/home/lihuichao/academic/SciTSR/dataset', normalize=True),
+    train_loader = DataLoader(SciTSR(partition=args.train_partition, dataset_dir='/home/lihuichao/academic/SciTSR/dataset', normalize=True, chunk=args.chunk, rel=args.rel),
                               num_workers=8, batch_size=args.batch_size, shuffle=True, drop_last=True)
     # test_loader = DataLoader(SciTSR(partition='test', dataset_dir='/home/lihuichao/academic/SciTSR/dataset', normalize=True),
     #                          num_workers=8, batch_size=args.test_batch_size, shuffle=True, drop_last=False)
@@ -88,8 +88,10 @@ def train(args, io):
         # os.makedirs(args.summary)
         from torch.utils.tensorboard import SummaryWriter
         writer = SummaryWriter(args.summary)
-
-    row_classifier, col_classifier = PairClassfier(512), PairClassfier(512)
+    if args.dgcnn:
+        row_classifier, col_classifier = PairClassfier(512), PairClassfier(512)
+    else:
+        row_classifier, col_classifier = PairClassfier(4), PairClassfier(4)
     # row_classifier, col_classifier = nn.DataParallel(row_classifier), nn.DataParallel(col_classifier)
     # model = nn.DataParallel(model)
     model.train()
@@ -124,7 +126,7 @@ def train(args, io):
 
     # best_test_iou = 0
 
-    data_paraller = DataParallel_wrapper(model, row_classifier, col_classifier)
+    data_paraller = DataParallel_wrapper(args, model, row_classifier, col_classifier)
     data_paraller.to(device)
     data_paraller = nn.DataParallel(data_paraller)
     inner_count = 0
@@ -154,7 +156,7 @@ def train(args, io):
                 loss = loss.sum()
 
                 if writer:
-                    writer.add_scalar('Loss/expand_rel', loss.item(), iterate_step)
+                    writer.add_scalar('Loss/expand_rel_linear', loss.item(), iterate_step)
                     logger.info(f'loss value: {loss.item()}')
                 loss.backward()
                 opt.step()
@@ -173,8 +175,8 @@ def train(args, io):
                    f'{args.saved_model_dir}/checkpoints_{iterate_step}')
         if writer:
             writer.flush()
-        outstr = 'Train %d, loss: %.6f ' % (epoch, train_loss * 1.0 / count)
-        io.cprint(outstr)
+        # outstr = 'Train %d, loss: %.6f ' % (epoch, train_loss * 1.0 / count)
+        # io.cprint(outstr)
 
 
 def test(args, io):
@@ -198,7 +200,11 @@ def test(args, io):
         #     model_dict[name] = v
         # logger.info(model_dict.keys())
         dgcnn.load_state_dict(model_dict['dgcnn'])
-        row_classifier, col_classifier = PairClassfier(512), PairClassfier(512)
+        if args.dgcnn:
+            row_classifier, col_classifier = PairClassfier(512), PairClassfier(512)
+        else:
+            row_classifier, col_classifier = PairClassfier(4), PairClassfier(4)
+
         # row_classifier, col_classifier = nn.DataParallel(row_classifier), nn.DataParallel(col_classifier)
         row_classifier.load_state_dict(model_dict['row_classifier'])
         col_classifier.load_state_dict(model_dict['col_classifier'])
@@ -223,8 +229,11 @@ def test(args, io):
                 num_vertices = num_vertices[0]
                 # data = data.permute(0,2,1)
                 batch_size = data.size(0)
-                out = dgcnn(data)  # (batch_size, 256, num_points)
-                out = out[:, :, :num_vertices]  # (batch_size, 256, num_vertices)
+                if args.dgcnn:
+                    out = dgcnn(data)  # (batch_size, 256, num_points)
+                    out = out[:, :, :num_vertices]  # (batch_size, 256, num_vertices)
+                else:
+                    out = features[:, :num_vertices, :4].transpose(2, 1) # (batch_size, 3, num_vertices)
                 # logger.debug(f'output shape: {out.shape}')
                 # logger.debug(f'output: {out}')
                 pred_row_matrix = torch.zeros([num_vertices, num_vertices], dtype=torch.int).to(device)
@@ -243,12 +252,15 @@ def test(args, io):
                     device), col_features1.to(device), col_features2.to(device)
                 logger.debug(
                     f'num vertices :{num_vertices}\trow1 features shape: {row_features1.shape}\tcol1 features shape: {col_features1.shape}')
-                row_pairs, col_pairs = torch.cat((row_features1, row_features2), 1), torch.cat((col_features1,
-                                                                                                col_features2),
-                                                                                               1)  # (batch_size, 512, combination(num_vertices, 2))
-                logger.debug(f'row pairs shape:  {row_pairs.shape}\tcol pairs shape: {col_pairs.shape}')
-                row_pairs, col_pairs = row_pairs.permute(0, 2, 1), col_pairs.permute(0, 2,
-                                                                                     1)  # (batch_size, combination(num_vertices,2), 512)
+                if args.dgcnn:
+                    row_pairs, col_pairs = torch.cat((row_features1, row_features2), 1), torch.cat((col_features1,
+                                                                                                    col_features2),
+                                                                                                   1)  # (batch_size, 512, combination(num_vertices, 2))
+                    logger.debug(f'row pairs shape:  {row_pairs.shape}\tcol pairs shape: {col_pairs.shape}')
+                    row_pairs, col_pairs = row_pairs.permute(0, 2, 1), col_pairs.permute(0, 2,
+                                                                                         1)  # (batch_size, combination(num_vertices,2), 512)
+                else:
+                    row_pairs, col_pairs = (row_features1 - row_features2).permute(0, 2, 1), (col_features1 - col_features2).permute(0, 2, 1)
                 row_output, col_output = row_classifier(row_pairs), col_classifier(
                     col_pairs)  # (batch_size, combination(num_vertices, 2), 2)
                 # logger.debug(f'row output shape: {row_output.shape}')
@@ -393,6 +405,9 @@ if __name__ == "__main__":
     parser.add_argument('--train_partition',type=str,default='train', metavar='N', help='partition of dataset')
     parser.add_argument('--log', type=str, default='', metavar='N', help='logger file name')
     parser.add_argument('--saved_predicted_dir', type=str, default='', metavar='N', help='dir path of predicted result')
+    parser.add_argument('--chunk', type=str, default='chunk_test', metavar='N', help='chunk dir name')
+    parser.add_argument('--rel', type=str, default='rel_test', metavar='N', help='rel name')
+    parser.add_argument('--dgcnn', action='store_true', default=False)
     args = parser.parse_args()
 
     _init_()

@@ -20,19 +20,55 @@ import numpy as np
 import torch
 import networkx as nx
 import itertools
+import json
 from torch.utils.data import Dataset
 from tqdm import tqdm
 from loguru import logger
 
 
+
 def get_all_paths_from_graph(G: nx.DiGraph):
+    character_set = {'a','b','c','d','e','f','g','h','i','j','k','l','m','n','o','p','q','r','s','t','u','v','w','x','y','z'}
+    pre_process_node_list = []
     ret = []
+    for node in G.nodes():
+        if G.in_degree(node) >= 2:
+            pre_process_node_list.append(node)
+            # logger.info(f'exists node with indegree bigger than 1, need some preprocess!')
+        if G.in_degree(node) > 26:
+            logger.warning(f'need some better representation form!')
+    for node in pre_process_node_list:
+        if G.in_degree(node) != G.out_degree(node) and G.out_degree(node) != 1 and G.out_degree(node) != 0:
+            logger.warning(f'cannot distinguish relations, pass~')
+            return ret
+        # split node
+        ancestors = list(G.predecessors(node))
+        if G.out_degree(node) != 1:
+            descendants = list(G.successors(node))
+        elif G.out_degree(node) == 1:
+            descendants = list(G.successors(node)) * len(ancestors)
+        elif G.out_degree(node) == 0:
+            descendants = []
+        G.remove_node(node)
+        start = 'a'
+        for i in range(len(ancestors)):
+            tmp = f'{node}{start}'
+            G.add_node(tmp)
+            G.add_edge(ancestors[i], tmp)
+            if len(descendants) == len(ancestors):
+                G.add_edge(tmp, descendants[i])
+            start = chr(ord(start)+1)
+
     for source in G.nodes():
         for target in G.nodes():
             if source != target and G.in_degree(source) == 0 and G.out_degree(target) == 0:
                 try:
                     paths = nx.all_simple_paths(G, source, target)
                     paths = list(paths)
+                    for single_path in paths:
+                        for i, char in enumerate(single_path):
+                            if type(char) == str and char[-1] in character_set:
+                                single_path[i] = int(char[:-1])
                     if len(paths) >= 2:
                         logger.warning(f'exists {len(paths)} path between source and target')
                     if len(paths) >= 10000:
@@ -249,7 +285,7 @@ def rotate_pointcloud(pointcloud):
     return pointcloud
 
 
-def load_scitsr_data(dataset_dir, partition, padding=False, max_vertice_num=512):
+def load_scitsr_data(dataset_dir, partition, padding=False, max_vertice_num=512, chunk='chunk', rel='rel'):
     """
     load scitsr dataset
     :param dataset_dir: dataset dir path
@@ -259,11 +295,10 @@ def load_scitsr_data(dataset_dir, partition, padding=False, max_vertice_num=512)
     :param feature_size: input feature size
     :return: the loaded dataset
     """
-    import json
 
     data, row_matrices, col_matrices = [], [], []
-    CHUNK = 'chunk'
-    REL = 'rel'
+    CHUNK = chunk
+    REL = rel
     main_folder = os.path.join(dataset_dir, partition)
     chunk_dir = os.path.join(main_folder, CHUNK)
     rel_dir = os.path.join(main_folder, REL)
@@ -348,12 +383,11 @@ class ModelNet40(Dataset):
     def __len__(self):
         return self.data.shape[0]
 
-
 class SciTSR(Dataset):
     def __init__(self, dataset_dir, max_vertice_num=1024, feature_size=15, partition='train', normalize=False,
-                 mean=None, std=None):
+                 mean=None, std=None, chunk='chunk', rel='rel'):
         self.data = load_scitsr_data(dataset_dir, partition,
-                                     max_vertice_num=max_vertice_num)  # data: [num_points * feature_size], row/col_matix: [num_points, num_points]
+                                     max_vertice_num=max_vertice_num, chunk=chunk, rel=rel)  # data: [num_points * feature_size], row/col_matix: [num_points, num_points]
         self.feature_size = feature_size
         self.max_vertice_num = max_vertice_num
         self.partition = partition
@@ -514,4 +548,4 @@ if __name__ == '__main__':
     # feature.sub_(mean).div_(std)
     # logger.info(feature)
     pre_process('/home/lihuichao/academic/SciTSR/dataset/train/rel_original',
-                '/home/lihuichao/academic/SciTSR/dataset/train/rel_new_new')
+                '/home/lihuichao/academic/SciTSR/dataset/train/rel_new')

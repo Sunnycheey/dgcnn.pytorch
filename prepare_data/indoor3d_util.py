@@ -148,7 +148,6 @@ def room2blocks(data, label, num_point, block_size=1.0, stride=1.0,
         block_datas: K x num_point x 6 np array of XYZRGB, RGB is in [0,1]
         block_labels: K x num_point x 1 np array of uint8 labels
         
-    TODO: for this version, blocking is in fixed, non-overlapping pattern.
     """
     assert(stride<=block_size)
 

@@ -379,6 +379,7 @@ class PairClassfier(nn.Module):
         self.dense3 = nn.Linear(18, 2)
 
     def forward(self, x):
+        logger.debug(f'input x: {x}')
         # x = self.dp1(x)
         x = F.relu(self.dense1(x))
         x = self.dp1(x)
@@ -467,14 +468,19 @@ class DGCNN_semseg(nn.Module):
 
 
 class DataParallel_wrapper(nn.Module):
-    def __init__(self, model, row_classifier, col_classifier):
+    def __init__(self, args, model, row_classifier, col_classifier):
         super(DataParallel_wrapper, self).__init__()
         self.model = model
         self.row_classifier, self.col_classifier = row_classifier, col_classifier
+        self.args = args
 
     def forward(self, data, row_matrix, col_matrix, num_vertices):
         # Todo: 检查column关系准确率低的问题
-        all_features = self.model(data)  # (batch_size, 256, num_vertices)
+        if self.args.dgcnn:
+            all_features = self.model(data)  # (batch_size, 256, num_vertices)
+        else:
+            all_features = data[:,:,:4].permute(0,2,1) # (batch_size, 4, num_vertices)
+        logger.debug(f'all feature shape: {all_features.shape}')
         # logger.debug(f'all features: {all_features.permute(0,2,1)}')
         batch_size = all_features.size(0)
         logger.debug(f'num vertices: {num_vertices[0]}')
@@ -497,98 +503,28 @@ class DataParallel_wrapper(nn.Module):
         col_point1 = all_features[non_zero_col[:, 0], :, non_zero_col[:, 1]]
         col_point2 = all_features[non_zero_col[:, 0], :, non_zero_col[:, 2]]
         col_input_shape = col_point1.size(0)
+
         logger.debug(f'row point1 shape: {row_point1.shape}\tcol point1 shape {col_point1.shape}')
-
-        # row_point3 = torch.zeros([row_input_shape, 256])
-        # col_point3 = torch.zeros([col_input_shape, 256])
-        # get negative sampling
-        # TODO: true sampling (using itertools production)
-        # for i, v in enumerate(num_vertices):
-        #     row_batch_idx = (zero_row[:, 0] == i)
-        #     col_batch_idx = (zero_col[:, 0] == i)
-        #     small_than_row = torch.logical_and((zero_row[row_batch_idx][:, 1] < v),
-        #                                        (zero_row[row_batch_idx][:, 2] < v))
-        #     small_than_col = torch.logical_and((zero_col[col_batch_idx][:, 1] < v),
-        #                                        (zero_col[col_batch_idx][:, 2] < v))
-        #
-        #     point3 = all_features[zero_row[row_batch_idx][small_than_row][:, 0], :,
-        #              zero_row[row_batch_idx][small_than_row][:, 1]]
-        #     # point4 = all_features[zero_row[row_batch_idx][small_than_row][:, 0], :, zero_row[row_batch_idx][small_than_row][:, 2]]
-        #
-        #     point5 = all_features[zero_col[col_batch_idx][small_than_col][:, 0], :,
-        #              zero_col[col_batch_idx][small_than_col][:, 1]]
-        #     # point6 = all_features[zero_col[col_batch_idx][small_than_col][:, 0], :, zero_col[col_batch_idx][small_than_col][:, 2]]
-        #     if i == 0:
-        #         row_point3 = point3
-        #         # row_point4 = point4
-        #         col_point3 = point5
-        #         # col_point4 = point6
-        #     else:
-        #         row_point3 = torch.cat((row_point3, point3), dim=0)
-        #         # row_point4 = torch.cat((row_point4, point4), dim=0)
-        #         col_point3 = torch.cat((col_point3, point5), dim=0)
-        #         # col_point4 = torch.cat((col_point4, point6), dim=0)
-
-        # row_zero_shape = row_point3.size(0)
-        # col_zero_shape = col_point3.size(0)
-        # # col_point3 = all_features[zero_col[:, 0], :, zero_col[:, 1]]
-        # # col_point4 = all_features[zero_col[:, 0], :, zero_col[:, 2]]
-        # row_weights = torch.ones([row_zero_shape])
-        # col_weights = torch.ones([col_zero_shape])
-        # logger.debug(f'{row_point1}\n{col_point1}')
-        # # sampling negative samples from original matrix
-        # if row_input_shape == 0:
-        #     row_sampling = torch.LongTensor([])
-        # else:
-        #     row_sampling = torch.multinomial(row_weights,
-        #                                      row_input_shape) if row_zero_shape > row_input_shape else torch.arange(
-        #         row_zero_shape)
-        # if col_input_shape == 0:
-        #     col_sampling = torch.LongTensor([])
-        # else:
-        #     col_sampling = torch.multinomial(col_weights,
-        #                                      col_input_shape) if col_zero_shape > col_input_shape else torch.arange(
-        #         col_zero_shape)
-
-        # when #negative sampling examples is smaller than positive number, we need to expand negative example
-        # a sample strategy is to padding negative vector with zeros
-
-        # row_neg_point = torch.zeros([row_input_shape, 256]).to('cuda')
-        # if row_input_shape > row_sampling.size(0):
-        #     logger.warning(f'row negative sampling padding with zero vector')
-        # row_neg_point[:row_sampling.size(0)] = row_point3[row_sampling]
-        #
-        # # row_point4 = row_point4[:row_input_shape] if row_point4.size(0) > (row_input_shape) else row_point4
-        # col_neg_point = torch.zeros([col_input_shape, 256]).to('cuda')
-        # if col_input_shape > col_sampling.size(0):
-        #     logger.warning(f'col negative sampling padding with zero vector')
-        # col_neg_point[:col_sampling.size(0)] = col_point3[col_sampling]
-        # col_point4 = col_point4[:col_input_shape] if col_point4.size(0) > (col_input_shape) else col_point4
-
-        # predict relation between row point & col point
-        row_pos_input = torch.cat((row_point1, row_point2), 1)
-        # row_pos_input1, row_pos_input2 = torch.cat((row_point1, row_point2), 1), torch.cat((row_point2, row_point1), 1)
-        # row_pos_input = torch.cat((row_pos_input1, row_pos_input2), 0)
-
-        row_neg_idx_pairs = sampling(row_matrix, -1)
-        row_neg_input = torch.cat((all_features[:, :, row_neg_idx_pairs[:, 0]], all_features[:, :, row_neg_idx_pairs[:, 1]]), dim=1)
-        row_neg_input = row_neg_input.squeeze().transpose(1,0)
-        # row_neg_input1, row_neg_input2, row_neg_input3, row_neg_input4 = torch.cat((row_neg_point, row_point1), 1), torch.cat(
-        #     (row_neg_point, row_point2), 1), torch.cat((row_point1, row_neg_point), 1), torch.cat((row_point2, row_neg_point), 1)
-        # row_neg_input = torch.cat((row_neg_input1, row_neg_input2, row_neg_input3, row_neg_input4), 0)
-        col_pos_input = torch.cat((col_point1, col_point2), 1)
-        # col_pos_input1, col_pos_input2 = torch.cat((col_point1, col_point2), 1), torch.cat((col_point2, col_point1), 1)
-        # col_pos_input = torch.cat((col_pos_input1, col_pos_input2), 0)
-        # col_neg_input1, col_neg_input2, col_neg_input3, col_neg_input4 = torch.cat((col_neg_point, col_point1), 1), torch.cat(
-        #     (col_neg_point, col_point2), 1), torch.cat((col_point1, col_neg_point), 1), torch.cat((col_point2, col_neg_point), 1)
-        # col_neg_input = torch.cat((col_neg_input1, col_neg_input2, col_neg_input3, col_neg_input4), 0)
         col_neg_idx_pairs = sampling(col_matrix, -1)
-        col_neg_input = torch.cat((all_features[:, :, col_neg_idx_pairs[:, 0]], all_features[:, :, col_neg_idx_pairs[:, 1]]), dim=1)
-        col_neg_input = col_neg_input.squeeze().transpose(1, 0)
-        logger.debug(f'row_pos_input shape: {row_pos_input.shape}\trow_neg_input shape: {row_neg_input.shape}')
+        row_neg_idx_pairs = sampling(row_matrix, -1)
+
+        if self.args.dgcnn:
+            row_pos_input = torch.cat((row_point1, row_point2), 1)
+            row_neg_input = torch.cat((all_features[:, :, row_neg_idx_pairs[:, 0]], all_features[:, :, row_neg_idx_pairs[:, 1]]), dim=1)
+            row_neg_input = row_neg_input.squeeze().transpose(1,0)
+            col_pos_input = torch.cat((col_point1, col_point2), 1)
+            col_neg_input = torch.cat((all_features[:, :, col_neg_idx_pairs[:, 0]], all_features[:, :, col_neg_idx_pairs[:, 1]]), dim=1)
+            col_neg_input = col_neg_input.squeeze().transpose(1, 0)
+            logger.debug(f'row_pos_input shape: {row_pos_input.shape}\trow_neg_input shape: {row_neg_input.shape}')
+
+        else:
+            row_pos_input = row_point1 - row_point2
+            col_pos_input = col_point1 - col_point2
+            row_neg_input = all_features[:, :, row_neg_idx_pairs[:, 0]].squeeze().transpose(1,0) - all_features[:, :, row_neg_idx_pairs[:, 1]].squeeze().transpose(1,0)
+            col_neg_input = all_features[:, :, col_neg_idx_pairs[:, 0]].squeeze().transpose(1,0) - all_features[:, :, col_neg_idx_pairs[:, 1]].squeeze().transpose(1,0)
+
         row_input = torch.cat((row_pos_input, row_neg_input), 0)  # (batch_size, *, 512)
         col_input = torch.cat((col_pos_input, col_neg_input), 0)  # (batch_size, *, 512)
-
         row_pos_gt, row_neg_gt = torch.ones([row_pos_input.size(0)], dtype=torch.long), torch.zeros(
             [row_neg_input.size(0)],
             dtype=torch.long)
