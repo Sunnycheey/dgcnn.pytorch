@@ -87,7 +87,7 @@ def pre_process(rel_dir: str, output_dir: str):
     :param output_dir the result dir
     :return: None
     """
-
+    ret = {'chunks': []}
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
     for file_path in tqdm(os.listdir(rel_dir)):
@@ -112,16 +112,29 @@ def pre_process(rel_dir: str, output_dir: str):
                     col_G.add_edge(start, end)
             # if not graph_assert(row_G): logger.info(file_path)
             # if not graph_assert(col_G): logger.info(file_path)
-        for row_points_set in get_all_paths_from_graph(row_G):
-            row_pairs = itertools.permutations(row_points_set, 2)
-            for (v1, v2) in row_pairs:
-                lines.append(f'{v1}\t{v2}\t1:0')
-        for col_points_set in get_all_paths_from_graph(col_G):
-            col_pairs = itertools.permutations(col_points_set, 2)
-            for (v1, v2) in col_pairs:
-                lines.append(f'{v1}\t{v2}\t2:0')
-        with open(f'{output_dir}/{file_path}', 'w') as f:
-            f.write('\n'.join([line for line in lines]))
+        # for row_points_set in get_all_paths_from_graph(row_G):
+        #     row_pairs = itertools.permutations(row_points_set, 2)
+        #     for (v1, v2) in row_pairs:
+        #         lines.append(f'{v1}\t{v2}\t1:0')
+        # for col_points_set in get_all_paths_from_graph(col_G):
+        #     col_pairs = itertools.permutations(col_points_set, 2)
+        #     for (v1, v2) in col_pairs:
+        #         lines.append(f'{v1}\t{v2}\t2:0')
+        # with open(f'{output_dir}/{file_path}', 'w') as f:
+        #     f.write('\n'.join([line for line in lines]))
+        chunk_id = '.'.join([a for a in file_path.split(".")[:-1]])
+        chunk_id += '.chunk'
+        chunk = {'id': chunk_id, 'row_spanning': [], 'col_spanning': []}
+        for n in row_G.nodes():
+            if row_G.in_degree(n) >= 2 or row_G.out_degree(n) >= 2:
+                chunk['row_spanning'].append(n)
+        for n in col_G.nodes():
+            if col_G.in_degree(n) >= 2 or col_G.out_degree(n) >= 2:
+                chunk['col_spanning'].append(n)
+        ret['chunks'].append(chunk)
+    with open(f'{output_dir}/test.json', 'w') as f:
+        json.dump(ret, f)
+
 
 
 def download_modelnet40():
@@ -547,5 +560,5 @@ if __name__ == '__main__':
     # print(std.tolist())
     # feature.sub_(mean).div_(std)
     # logger.info(feature)
-    pre_process('/home/lihuichao/academic/SciTSR/dataset/train/rel_original',
-                '/home/lihuichao/academic/SciTSR/dataset/train/rel_new')
+    pre_process('/home/lihuichao/academic/SciTSR/dataset/test/rel_original',
+                '/home/lihuichao/academic/SciTSR/dataset/test/rel_tt')
